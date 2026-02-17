@@ -337,9 +337,6 @@ Edit your Traefik static configuration file (e.g., `traefik_config.yml`):
 entryPoints:
   web:
     address: :80
-    http:
-      middlewares:
-        - geoblock@file
   websecure:
     address: :443
     http:
