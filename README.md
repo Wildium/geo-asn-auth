@@ -78,8 +78,8 @@ In this default `config.yaml`, I have the following policies
 countries:
   mode: whitelist  # Options: whitelist, blacklist, disabled
   whitelist:
-    - US  # United States
-    - CA  # Canada
+    - "US"  # United States
+    - "CA"  # Canada
   blacklist: []
 
 # ASN Filtering
@@ -231,8 +231,8 @@ domains:
     countries:
       mode: blacklist  # Override just the country mode
       blacklist:
-        - CN  # Block China
-        - RU  # Block Russia
+        - "CN"  # Block China
+        - "RU"  # Block Russia
     # ASN and user_agent inherit from global config
 ```
 
