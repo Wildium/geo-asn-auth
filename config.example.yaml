@@ -22,13 +22,13 @@ ip:
 countries:
   mode: whitelist  # Options: whitelist, blacklist, disabled
   whitelist:
-    - US  # United States
-    # - CA  # Canada
-    # - GB  # United Kingdom
+    - "US"  # United States
+    # - "CA"  # Canada
+    # - "GB"  # United Kingdom
   blacklist: []
-    # - CN  # China
-    # - RU  # Russia
-    # - KP  # North Korea
+    # - "CN"  # China
+    # - "RU"  # Russia
+    # - "KP"  # North Korea
 
 # User-Agent Filtering
 # Filter requests based on User-Agent header (substring matching)
