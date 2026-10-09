@@ -11,9 +11,10 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Cache directory for downloaded ASN lists
-CACHE_DIR = '/blocklists'
-os.makedirs(CACHE_DIR, exist_ok=True)
+# Cache directory for downloaded ASN lists (configurable for tests/non-root runs).
+# Created lazily on first fetch so importing the module never fails on a
+# read-only or unwritable default path.
+CACHE_DIR = os.getenv('BLOCKLIST_CACHE_DIR', '/blocklists')
 
 
 def fetch_text_list(url, cache_hours=168, list_type='text'):
@@ -29,8 +30,11 @@ def fetch_text_list(url, cache_hours=168, list_type='text'):
     Returns:
         set: Set of non-empty, stripped lines from the file
     """
-    cache_dir = "/blocklists"
-    os.makedirs(cache_dir, exist_ok=True)
+    cache_dir = CACHE_DIR
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        pass
     
     # Generate cache filename based on URL
     url_hash = hashlib.md5(url.encode()).hexdigest()
@@ -140,6 +144,10 @@ def _fetch_remote_asn_list(source, timeout, cache_hours):
     url_hash = hashlib.md5(source.encode()).hexdigest()
     cache_file = os.path.join(CACHE_DIR, f"asn_list_{url_hash}.txt")
     cache_time_file = os.path.join(CACHE_DIR, f"asn_list_{url_hash}.time")
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+    except OSError:
+        pass
     
     # Check if cached file exists and is recent
     content = _read_cache_if_valid(cache_file, cache_time_file, cache_hours, source)

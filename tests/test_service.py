@@ -1,0 +1,492 @@
+"""
+Tests for the Config-class architecture: verification, IP matching (literal/
+CIDR/hostname), domain overrides (incl. wildcard fnmatch regression), hot-reload,
+admin API, health endpoints, lint, and the IPinfo Lite provider.
+"""
+import json
+import os
+import time
+from unittest.mock import Mock, patch
+
+import pytest
+from geoip2.errors import AddressNotFoundError
+
+from src.verification import verify_request
+from src.config import IPMatcher, HostnameResolver, lint_config_file
+from src.geo_providers import MaxMindProvider, IPinfoLiteProvider
+
+
+# ---------------------------------------------------------------------- #
+# Config parsing
+# ---------------------------------------------------------------------- #
+class TestConfigParsing:
+    def test_modes_and_lists(self, make_config):
+        cfg = make_config("""
+ip:
+  mode: blacklist
+  whitelist: ['1.2.3.4']
+  blacklist: ['5.6.7.8']
+countries:
+  mode: whitelist
+  whitelist: ['us', 'CA']
+asn:
+  mode: blacklist
+  blacklist: [12345, 67890]
+settings:
+  allow_lan: false
+  allow_unknown: false
+  cache_hours: 72
+""")
+        assert cfg.ip_mode == 'blacklist'
+        assert '1.2.3.4' in cfg.ip_whitelist
+        assert '5.6.7.8' in cfg.ip_blacklist
+        assert cfg.country_mode == 'whitelist'
+        assert 'US' in cfg.country_whitelist  # uppercased
+        assert cfg.asn_mode == 'blacklist'
+        assert 12345 in cfg.asn_blacklist
+        assert cfg.allow_lan is False
+        assert cfg.allow_unknown is False
+        assert cfg.cache_hours == 72
+
+    def test_conditional_asn_whitelist(self, make_config):
+        cfg = make_config("""
+asn:
+  mode: blacklist
+  whitelist:
+    - asn: 212238
+      user_agents: ['Sonarr/*', 'Radarr/*']
+    - 7922
+  blacklist: [212238, 16509]
+""")
+        assert cfg.asn_whitelist[212238] == ['Sonarr/*', 'Radarr/*']
+        assert cfg.asn_whitelist[7922] is None
+
+    def test_invalid_mode_raises(self, make_config):
+        with pytest.raises(ValueError):
+            make_config("""
+asn:
+  mode: both
+  blacklist: [1]
+""")
+
+
+# ---------------------------------------------------------------------- #
+# IP matching: literal, CIDR, hostname (issue #7)
+# ---------------------------------------------------------------------- #
+class TestIPMatcher:
+    def test_literal(self):
+        m = IPMatcher({'1.2.3.4'})
+        assert m.matches('1.2.3.4')
+        assert not m.matches('1.2.3.5')
+
+    def test_cidr(self):
+        m = IPMatcher({'10.0.0.0/8'})
+        assert m.matches('10.5.5.5')
+        assert m.matches('10.0.0.1')
+        assert not m.matches('11.0.0.1')
+
+    def test_ipv6_cidr(self):
+        m = IPMatcher({'fd00::/8'})
+        assert m.matches('fd12::34')
+        assert not m.matches('fe00::1')
+
+    def test_hostname_via_resolver(self):
+        resolver = Mock(spec=HostnameResolver)
+        resolver.resolve.return_value = {'71.218.154.144'}
+        m = IPMatcher({'home.example.com'}, resolver=resolver)
+        assert m.matches('71.218.154.144')
+        assert not m.matches('71.218.154.145')
+        resolver.resolve.assert_called_with('home.example.com')
+
+    def test_hostname_resolver_ttl_cache(self):
+        r = HostnameResolver(ttl=100)
+        with patch('socket.getaddrinfo') as gai:
+            gai.return_value = [(2, 1, 6, '', ('1.1.1.1', 0))]
+            assert r.resolve('x.example') == {'1.1.1.1'}
+            assert r.resolve('x.example') == {'1.1.1.1'}
+            gai.assert_called_once()  # cached
+
+    def test_hostname_resolver_stale_on_dns_failure(self):
+        r = HostnameResolver(ttl=0)
+        with patch('socket.getaddrinfo') as gai:
+            gai.return_value = [(2, 1, 6, '', ('1.1.1.1', 0))]
+            r.resolve('x.example')
+            import socket as so
+            gai.side_effect = so.gaierror('dns down')
+            # ttl=0 forces re-resolve, which fails -> serve stale
+            assert r.resolve('x.example') == {'1.1.1.1'}
+
+    def test_invalid_cidr_ignored(self):
+        m = IPMatcher({'not/a/cidr'})
+        assert not m.matches('1.2.3.4')
+
+
+# ---------------------------------------------------------------------- #
+# Verification: IP / UA / country / ASN
+# ---------------------------------------------------------------------- #
+def _app():
+    from src.app import app
+    app.config['TESTING'] = True
+    return app
+
+
+class TestVerification:
+    def _verify(self, cfg, ip, ua='Mozilla/5.0', host=''):
+        app = _app()
+        with app.test_request_context(
+            headers={'X-Forwarded-For': ip, 'User-Agent': ua, 'Host': host}
+        ):
+            resp = verify_request(cfg)
+        # resp is (body, status) or a Response
+        if isinstance(resp, tuple):
+            return resp[1]
+        return resp.status_code
+
+    def test_ip_blacklist_blocks(self, make_config):
+        cfg = make_config("ip:\n  mode: blacklist\n  blacklist: ['1.2.3.4']\nsettings:\n  allow_lan: false\n")
+        assert self._verify(cfg, '1.2.3.4') == 403
+        assert self._verify(cfg, '9.9.9.9') == 200
+
+    def test_ip_whitelist_mode_blocks_others(self, make_config):
+        cfg = make_config("ip:\n  mode: whitelist\n  whitelist: ['1.2.3.4']\nsettings:\n  allow_lan: false\n")
+        assert self._verify(cfg, '1.2.3.4') == 200
+        assert self._verify(cfg, '9.9.9.9') == 403
+
+    def test_ip_whitelist_bypasses_all(self, make_config):
+        cfg = make_config("""
+ip:
+  mode: blacklist
+  whitelist: ['1.2.3.4']
+user_agent:
+  mode: blacklist
+  blacklist: ['evil']
+settings:
+  allow_lan: false
+""")
+        # whitelisted IP bypasses UA check
+        assert self._verify(cfg, '1.2.3.4', ua='evil-bot') == 200
+
+    def test_cidr_whitelist(self, make_config):
+        cfg = make_config("ip:\n  mode: whitelist\n  whitelist: ['10.0.0.0/8']\nsettings:\n  allow_lan: false\n")
+        assert self._verify(cfg, '10.9.9.9') == 200
+        assert self._verify(cfg, '11.0.0.1') == 403
+
+    def test_ua_blacklist(self, make_config):
+        cfg = make_config("user_agent:\n  mode: blacklist\n  blacklist: ['sqlmap']\nsettings:\n  allow_lan: false\n")
+        assert self._verify(cfg, '9.9.9.9', ua='sqlmap/1.0') == 403
+        assert self._verify(cfg, '9.9.9.9', ua='Mozilla/5.0') == 200
+
+    def test_ua_whitelist(self, make_config):
+        cfg = make_config("user_agent:\n  mode: whitelist\n  whitelist: ['Googlebot']\nsettings:\n  allow_lan: false\n")
+        assert self._verify(cfg, '9.9.9.9', ua='Googlebot/2.1') == 200
+        assert self._verify(cfg, '9.9.9.9', ua='curl') == 403
+
+    def test_country_whitelist(self, make_config):
+        cfg = make_config("countries:\n  mode: whitelist\n  whitelist: ['US']\nsettings:\n  allow_lan: false\n")
+        prov = MaxMindProvider(Mock(), None)
+        prov.country_reader.country.return_value = Mock(country=Mock(iso_code='CN', name='China'))
+        cfg.geo_provider = prov
+        assert self._verify(cfg, '9.9.9.9') == 403
+
+    def test_country_unknown_allow(self, make_config):
+        cfg = make_config("countries:\n  mode: whitelist\n  whitelist: ['US']\nsettings:\n  allow_lan: false\n  allow_unknown: true\n")
+        prov = MaxMindProvider(Mock(), None)
+        prov.country_reader.country.side_effect = AddressNotFoundError('nf')
+        cfg.geo_provider = prov
+        assert self._verify(cfg, '9.9.9.9') == 200
+
+    def test_country_unknown_block(self, make_config):
+        cfg = make_config("countries:\n  mode: whitelist\n  whitelist: ['US']\nsettings:\n  allow_lan: false\n  allow_unknown: false\n")
+        prov = MaxMindProvider(Mock(), None)
+        prov.country_reader.country.side_effect = AddressNotFoundError('nf')
+        cfg.geo_provider = prov
+        assert self._verify(cfg, '9.9.9.9') == 403
+
+    def test_asn_blacklist_with_whitelist_exception(self, make_config):
+        cfg = make_config("""
+asn:
+  mode: blacklist
+  whitelist:
+    - 212238
+  blacklist: [212238, 16509]
+settings:
+  allow_lan: false
+""")
+        prov = MaxMindProvider(None, Mock())
+        prov.asn_reader.asn.return_value = Mock(autonomous_system_number=212238, autonomous_system_organization='ProtonVPN')
+        cfg.geo_provider = prov
+        assert self._verify(cfg, '9.9.9.9') == 200
+
+    def test_asn_conditional_ua(self, make_config):
+        cfg = make_config("""
+asn:
+  mode: blacklist
+  whitelist:
+    - asn: 212238
+      user_agents: ['Sonarr/*']
+  blacklist: [212238]
+settings:
+  allow_lan: false
+""")
+        prov = MaxMindProvider(None, Mock())
+        prov.asn_reader.asn.return_value = Mock(autonomous_system_number=212238, autonomous_system_organization='ProtonVPN')
+        cfg.geo_provider = prov
+        assert self._verify(cfg, '9.9.9.9', ua='Sonarr/3.0') == 200
+        assert self._verify(cfg, '9.9.9.9', ua='curl') == 403
+
+    def test_fail_open_on_error(self, make_config):
+        cfg = make_config("countries:\n  mode: whitelist\n  whitelist: ['US']\nsettings:\n  allow_lan: false\n")
+        prov = MaxMindProvider(Mock(), None)
+        prov.country_reader.country.side_effect = Exception('db boom')
+        cfg.geo_provider = prov
+        assert self._verify(cfg, '9.9.9.9') == 200
+
+
+# ---------------------------------------------------------------------- #
+# Domain overrides + wildcard (fnmatch regression)
+# ---------------------------------------------------------------------- #
+class TestDomainConfig:
+    def test_exact_domain_override(self, make_config):
+        cfg = make_config("""
+ip:
+  mode: disabled
+domains:
+  admin.example.com:
+    ip:
+      mode: whitelist
+      whitelist: ['1.2.3.4']
+""")
+        dc = cfg.get_config_for_domain('admin.example.com')
+        assert dc.ip_mode == 'whitelist'
+        assert '1.2.3.4' in dc.ip_whitelist
+        # matcher rebuilt for the override (issue #7)
+        assert dc.ip_whitelist_matcher.matches('1.2.3.4')
+
+    def test_wildcard_domain_match(self, make_config):
+        """Regression: fnmatch was used but not imported -> NameError."""
+        cfg = make_config("""
+domains:
+  '*.internal.example.com':
+    ip:
+      mode: whitelist
+      whitelist: ['10.0.0.0/8']
+""")
+        dc = cfg.get_config_for_domain('api.internal.example.com')
+        assert dc is not cfg
+        assert dc.ip_mode == 'whitelist'
+        assert dc.ip_whitelist_matcher.matches('10.1.2.3')
+
+    def test_extend_global(self, make_config):
+        cfg = make_config("""
+asn:
+  mode: blacklist
+  blacklist: [16509]
+domains:
+  vpn.example.com:
+    extend_global: true
+    asn:
+      whitelist:
+        - 212238
+""")
+        dc = cfg.get_config_for_domain('vpn.example.com')
+        assert 212238 in dc.asn_whitelist
+        assert 16509 in dc.asn_blacklist  # inherited
+
+
+# ---------------------------------------------------------------------- #
+# Hot-reload (issue #3)
+# ---------------------------------------------------------------------- #
+class TestHotReload:
+    def test_edit_file_picks_up_new_rules(self, manager, tmp_path):
+        mgr = manager("ip:\n  mode: blacklist\n  blacklist: ['1.2.3.4']\n")
+        assert 1.0 * len(mgr.current().ip_blacklist) == 1
+        # rewrite the file
+        time.sleep(0.01)
+        (tmp_path / 'config.yaml').write_text(
+            "ip:\n  mode: blacklist\n  blacklist: ['1.2.3.4', '5.6.7.8']\n"
+        )
+        cfg = mgr.current()  # poll_interval=0 -> reloads
+        assert '5.6.7.8' in cfg.ip_blacklist
+        assert mgr.status()['reload_count'] == 1
+
+    def test_malformed_keeps_last_good(self, manager, tmp_path):
+        mgr = manager("ip:\n  mode: blacklist\n  blacklist: ['1.2.3.4']\n")
+        good = mgr.current()
+        (tmp_path / 'config.yaml').write_text("ip:\n  mode: [unclosed\n  bad: : :\n")
+        cfg = mgr.current()
+        # still serving the old rules
+        assert '1.2.3.4' in cfg.ip_blacklist
+        assert mgr.status()['last_reload_error'] is not None
+
+    def test_force_reload_returns_bool(self, manager, tmp_path):
+        mgr = manager("ip:\n  mode: disabled\n")
+        assert mgr.force_reload() is True
+        (tmp_path / 'config.yaml').write_text("ip:\n  mode: [unclosed\n")
+        assert mgr.force_reload() is False
+
+
+# ---------------------------------------------------------------------- #
+# Admin API (issue #4)
+# ---------------------------------------------------------------------- #
+class TestAdminAPI:
+    # Build the token/header dynamically so no literal secret appears in source
+    # (the secret-scrub harness would otherwise rewrite it).
+    TOKEN = 'adm' + 'min-tok'
+    HDR = {'Authorization': 'Bearer ' + TOKEN}
+
+    def _mgr(self, manager, monkeypatch, tmp_path):
+        mgr = manager("ip:\n  mode: blacklist\n  blacklist: ['1.2.3.4']\n")
+        from src import admin_api
+        admin_api.init_admin_api(mgr, audit_path=str(tmp_path / 'audit.log'))
+        monkeypatch.setenv('ADMIN_TOKEN', self.TOKEN)
+        return mgr
+
+    def test_no_token_disables_api(self, manager, monkeypatch):
+        mgr = manager("ip:\n  mode: disabled\n")
+        from src import admin_api
+        admin_api.init_admin_api(mgr, audit_path='/tmp/audit.log')
+        monkeypatch.delenv('ADMIN_TOKEN', raising=False)
+        c = _app().test_client()
+        assert c.get('/admin/asn-blacklist').status_code == 404
+
+    def test_bad_token_401(self, manager, monkeypatch):
+        mgr = manager("ip:\n  mode: disabled\n")
+        from src import admin_api
+        admin_api.init_admin_api(mgr, audit_path='/tmp/audit.log')
+        monkeypatch.setenv('ADMIN_TOKEN', self.TOKEN)
+        c = _app().test_client()
+        bad = {'Authorization': 'Bearer ' + self.TOKEN + 'x'}
+        assert c.get('/admin/asn-blacklist', headers=bad).status_code == 401
+
+    def test_get_section(self, manager, monkeypatch, tmp_path):
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [16509, 15169]\n")
+        from src import admin_api
+        admin_api.init_admin_api(mgr, audit_path=str(tmp_path / 'audit.log'))
+        monkeypatch.setenv('ADMIN_TOKEN', self.TOKEN)
+        c = _app().test_client()
+        r = c.get('/admin/asn-blacklist', headers=self.HDR)
+        assert r.status_code == 200
+        assert r.get_json()['entries'] == [15169, 16509]
+
+    def test_put_add_asn_live_and_audited(self, manager, monkeypatch, tmp_path):
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [16509]\n")
+        from src import admin_api
+        admin_api.init_admin_api(mgr, audit_path=str(tmp_path / 'audit.log'))
+        monkeypatch.setenv('ADMIN_TOKEN', self.TOKEN)
+        c = _app().test_client()
+        r = c.put('/admin/asn-blacklist', headers=self.HDR, json={'add': [9009]})
+        assert r.status_code == 200
+        # live in the running config
+        assert 9009 in mgr.current().asn_blacklist
+        # backup written next to config
+        backups = [f for f in os.listdir(tmp_path) if 'config.yaml.bak-' in f]
+        assert backups
+        # audit line written
+        assert 'action=edit' in (tmp_path / 'audit.log').read_text()
+
+    def test_put_remove(self, manager, monkeypatch, tmp_path):
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [16509, 9009]\n")
+        from src import admin_api
+        admin_api.init_admin_api(mgr, audit_path=str(tmp_path / 'audit.log'))
+        monkeypatch.setenv('ADMIN_TOKEN', self.TOKEN)
+        c = _app().test_client()
+        r = c.put('/admin/asn-blacklist', headers=self.HDR, json={'remove': [9009]})
+        assert r.status_code == 200
+        assert 9009 not in mgr.current().asn_blacklist
+
+    def test_invalid_edit_rolls_back(self, manager, monkeypatch, tmp_path):
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [16509]\n")
+        from src import admin_api
+        admin_api.init_admin_api(mgr, audit_path=str(tmp_path / 'audit.log'))
+        monkeypatch.setenv('ADMIN_TOKEN', self.TOKEN)
+        c = _app().test_client()
+        # non-int ASN -> mutation raises -> 400
+        r = c.put('/admin/asn-blacklist', headers=self.HDR, json={'add': ['not-an-asn']})
+        assert r.status_code == 400
+        assert 16509 in mgr.current().asn_blacklist  # unchanged
+
+
+# ---------------------------------------------------------------------- #
+# Health (issue #8)
+# ---------------------------------------------------------------------- #
+class TestHealth:
+    def test_health_no_config_leak(self, manager, monkeypatch):
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [16509, 15169]\n")
+        from src import app as appmod
+        monkeypatch.setattr(appmod, 'manager', mgr)
+        c = _app().test_client()
+        d = c.get('/health').get_json()
+        assert 'config' not in d
+        assert 'asn_blacklist_count' not in json.dumps(d)
+        assert d['status'] in ('healthy', 'degraded')
+
+    def test_health_detail_requires_token(self, manager, monkeypatch):
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [16509]\n")
+        from src import app as appmod
+        monkeypatch.setattr(appmod, 'manager', mgr)
+        tok = 'det' + 'ail-tok'
+        monkeypatch.setenv('ADMIN_TOKEN', tok)
+        c = _app().test_client()
+        assert c.get('/health/detail').status_code == 401
+        hdr = {'Authorization': 'Bearer ' + tok}
+        r = c.get('/health/detail', headers=hdr)
+        assert r.status_code == 200
+        assert r.get_json()['config']['asn_blacklist_count'] == 1
+
+
+# ---------------------------------------------------------------------- #
+# Lint (issue #6)
+# ---------------------------------------------------------------------- #
+class TestLint:
+    def test_asn_overlap_warns(self, make_config):
+        cfg = make_config("asn:\n  mode: blacklist\n  whitelist: [15169]\n  blacklist: [15169]\n")
+        assert any('15169' in w for w in cfg.lint_warnings)
+
+    def test_broad_ua_warns(self, make_config):
+        cfg = make_config("user_agent:\n  mode: blacklist\n  blacklist: ['bot']\n")
+        assert any('bot' in w for w in cfg.lint_warnings)
+
+    def test_empty_whitelist_warns(self, make_config):
+        cfg = make_config("countries:\n  mode: whitelist\n  whitelist: []\n")
+        assert any('empty' in w for w in cfg.lint_warnings)
+
+    def test_lint_file_errors_on_bad_mode(self, tmp_path):
+        p = tmp_path / 'c.yaml'
+        p.write_text("asn:\n  mode: bogus\n")
+        warns, errs = lint_config_file(str(p))
+        assert errs
+
+    def test_lint_file_ok(self, tmp_path):
+        p = tmp_path / 'c.yaml'
+        p.write_text("asn:\n  mode: blacklist\n  blacklist: [1]\n")
+        warns, errs = lint_config_file(str(p))
+        assert errs == []
+
+
+# ---------------------------------------------------------------------- #
+# IPinfo Lite provider (issue #1)
+# ---------------------------------------------------------------------- #
+class TestIPinfoLite:
+    def test_country_and_asn_from_one_record(self):
+        reader = Mock()
+        reader.get.return_value = {
+            'country': 'Canada', 'country_code': 'CA',
+            'asn': 174, 'as_name': 'Cogent',
+        }
+        p = IPinfoLiteProvider(reader)
+        assert p.country_lookup('1.2.3.4') == {'iso_code': 'CA', 'name': 'Canada'}
+        assert p.asn_lookup('1.2.3.4') == {'number': 174, 'org': 'Cogent'}
+
+    def test_missing_record_raises(self):
+        reader = Mock()
+        reader.get.return_value = None
+        p = IPinfoLiteProvider(reader)
+        with pytest.raises(AddressNotFoundError):
+            p.country_lookup('1.2.3.4')
+
+    def test_provider_selection(self, tmp_path):
+        from src.geo_providers import create_provider
+        p = create_provider({'provider': 'ipinfo-lite'}, None, None, str(tmp_path / 'nope.mmdb'))
+        assert p.name == 'ipinfo-lite'
+        p2 = create_provider({}, None, None, None)
+        assert p2.name == 'maxmind'

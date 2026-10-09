@@ -3,6 +3,11 @@
 
 # IP Address Filtering
 # Direct IP-based allow/block before country/ASN checks
+# Entries accept three forms:
+#   - literal IP:        "71.218.154.144"
+#   - CIDR network:      "10.0.0.0/8"
+#   - hostname (DDNS):   "home.example.com"  (resolved + cached with TTL, so a
+#     rotating residential IP keeps working without a config edit — issue #7)
 ip:
   mode: blacklist  # Options: whitelist, blacklist, disabled
   
@@ -11,6 +16,8 @@ ip:
   # whitelist: 
     # - 169.150.254.37     # Trusted IP
     # - 10.0.0.50    # Office IP
+    # - 10.0.0.0/8         # CIDR range
+    # - home.example.com   # DDNS hostname (resolved with TTL cache)
   
   # Blacklist: Always blocked regardless of country/ASN
   blacklist: []
@@ -47,12 +54,13 @@ user_agent:
   # Manual user-agent entries (combined with fetched lists)
   # NOTE: These are substring matches (case-insensitive)
   # "PHPCrawl" will block "Mozilla/5.0 PHPCrawl/1.0" and "SomeBot (PHPCrawl compatible)"
+  # AVOID bare broad substrings like "bot"/"crawler" — they false-positive on
+  # legitimate UAs (e.g. "robot", "Abbott"). The curated remote bad-bot list
+  # above already covers real bots; keep manual entries specific.
   blacklist:
     - "sqlmap"
     - "nikto"
     - "nmap"
-    - "bot"
-    - "crawler"
     - "python-requests"
   # whitelist:
     # - "Googlebot"
@@ -121,6 +129,19 @@ settings:
   allow_unknown: true      # Allow if country/ASN cannot be determined
   use_html_response: true  # Return HTML block page (false for JSON response)
   cache_hours: 168         # Cache duration for remote ASN lists (default: 168 hours = 7 days)
+  dns_ttl: 60              # TTL (seconds) for hostname/DDNS entries in IP lists
+
+# Geo Database Provider
+# Choose the backend for country + ASN lookups.
+#   maxmind (default): two separate GeoLite2 MMDB files (Country + ASN).
+#   ipinfo-lite:       ONE combined MMDB (country + ASN per record), updated
+#     daily, CC-BY-SA 4.0 licensed, no signup for the project. Download with a
+#     free token:
+#       curl -L "https://ipinfo.io/data/ipinfo_lite.mmdb?token=$TOKEN" -o ipinfo_lite.mmdb
+#     then mount it and point ipinfo_lite_db at it.
+# geoip:
+#   provider: ipinfo-lite
+#   ipinfo_lite_db: /data/ipinfo_lite.mmdb
 
 # Domain-Specific Configuration Overrides
 # Override global settings for specific domains (matched against Host header)

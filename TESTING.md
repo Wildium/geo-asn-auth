@@ -9,85 +9,74 @@ pip install -r requirements-dev.txt
 
 Run all tests:
 ```bash
-pytest test_app.py -v
+pytest tests/ -v
 ```
 
 Run with coverage report:
 ```bash
-pytest test_app.py -v --cov=app --cov-report=html --cov-report=term
+pytest tests/ -v --cov=src --cov-report=html --cov-report=term
 ```
 
 Run specific test class:
 ```bash
-pytest test_app.py::TestIPFiltering -v
+pytest tests/test_service.py::TestIPMatcher -v
 ```
 
 Run specific test:
 ```bash
-pytest test_app.py::TestIPFiltering::test_ip_blacklist_mode_whitelist_bypass -v
+pytest tests/test_service.py::TestAdminAPI::test_put_add_asn_live_and_audited -v
 ```
 
 ## Test Coverage
 
-The test suite covers:
+The test suite (`tests/test_service.py`) covers:
 
 ### Configuration
-- ✅ Loading from YAML files
-- ✅ Environment variable overrides
-- ✅ Configuration hierarchy
+- ✅ Loading from YAML files (modes, lists, settings, env overrides)
+- ✅ Conditional ASN whitelist entries (per-user-agent rules)
+- ✅ Invalid mode raises at load
 
-### IP Filtering
-- ✅ Blacklist mode with whitelist bypass
-- ✅ Blacklist mode with blacklist blocking
-- ✅ Whitelist mode strict filtering
-- ✅ Unlisted IPs continuing to other checks
+### IP Matching (literal / CIDR / hostname)
+- ✅ Literal IP matching
+- ✅ CIDR ranges (IPv4 + IPv6)
+- ✅ Hostname/DDNS entries via TTL-cached resolver
+- ✅ Stale-on-DNS-failure behavior
+- ✅ Invalid CIDR ignored
 
-### Private IP Handling
-- ✅ Private IPs allowed when ALLOW_LAN=true
-- ✅ Private IPs checked when ALLOW_LAN=false
-- ✅ All private IP ranges (192.168.x.x, 10.x.x.x, 172.16-31.x.x, 127.x.x.x, 169.254.x.x)
+### Verification (ForwardAuth)
+- ✅ IP blacklist/whitelist modes, whitelist bypass
+- ✅ CIDR whitelist
+- ✅ User-agent blacklist/whitelist
+- ✅ Country whitelist/blacklist + unknown handling (allow/block)
+- ✅ ASN blacklist with whitelist exception + conditional UA
+- ✅ Fail-open on errors
 
-### Country Filtering
-- ✅ Whitelist mode allowing listed countries
-- ✅ Whitelist mode blocking unlisted countries
-- ✅ Blacklist mode allowing unlisted countries
-- ✅ Blacklist mode blocking listed countries
-- ✅ Unknown country handling with ALLOW_UNKNOWN=true
-- ✅ Unknown country blocking with ALLOW_UNKNOWN=false
+### Domain Overrides
+- ✅ Exact domain override (matchers rebuilt)
+- ✅ Wildcard `*.example.com` matching (fnmatch regression)
+- ✅ `extend_global` merge
 
-### ASN Filtering
-- ✅ Whitelist mode allowing listed ASNs
-- ✅ Whitelist mode blocking unlisted ASNs
-- ✅ Blacklist mode allowing unlisted ASNs
-- ✅ Blacklist mode blocking listed ASNs
-- ✅ **Whitelist exception in blacklist mode** (key feature)
-- ✅ Unknown ASN handling with ALLOW_UNKNOWN=true
-- ✅ Unknown ASN blocking with ALLOW_UNKNOWN=false
+### Hot-Reload
+- ✅ File edit picked up without restart
+- ✅ Malformed config keeps last-good + records error
+- ✅ force_reload returns success bool
 
-### Combined Filtering
-- ✅ IP whitelist bypassing country/ASN checks
-- ✅ Country pass continuing to ASN check
-- ✅ Multiple filter layers working together
+### Admin API
+- ✅ No token → API disabled (404); bad token → 401
+- ✅ GET section; PUT add/remove live + backup + audit
+- ✅ Invalid edit rolls back
 
-### ASN List Fetching
-- ✅ Remote URL fetching
-- ✅ Local file loading
-- ✅ Caching mechanism (saves network requests)
-- ✅ Cache expiration (refreshes stale data)
+### Health
+- ✅ /health reveals no rule contents
+- ✅ /health/detail requires token
 
-### Health Endpoint
-- ✅ Status reporting
-- ✅ Configuration exposure
-- ✅ Database availability checks
+### Lint
+- ✅ ASN overlap, broad UA substring, empty whitelist warnings
+- ✅ lint-file CLI errors on bad mode
 
-### IP Extraction
-- ✅ X-Forwarded-For header parsing
-- ✅ X-Real-IP fallback
-- ✅ Multiple IPs in chain handling
-
-### Error Handling
-- ✅ Fail-open behavior on exceptions
-- ✅ Service disruption prevention
+### IPinfo Lite Provider
+- ✅ Country + ASN from one record
+- ✅ Missing record raises; provider selection
 
 ## Docker Testing
 
@@ -95,7 +84,7 @@ Build and test in Docker:
 ```bash
 cd /home/ubuntu/docker/pangolin
 sudo docker compose build geoblock-service
-sudo docker compose run --rm geoblock-service pytest /app/test_app.py -v
+sudo docker compose run --rm geoblock-service pytest /app/tests -v
 ```
 
 ## Continuous Integration
@@ -106,22 +95,21 @@ Tests are designed to work with GitHub Actions and can be integrated into CI/CD 
 - name: Run tests
   run: |
     pip install -r requirements-dev.txt
-    pytest test_app.py -v --cov=app --cov-report=xml
+    pytest tests/ -v --cov=src --cov-report=xml
 ```
 
 ## Test Structure
 
 Each test class focuses on a specific aspect:
-- `TestConfiguration` - Configuration loading and parsing
-- `TestIPFiltering` - IP whitelist/blacklist behavior
-- `TestPrivateIPHandling` - Private/LAN IP handling
-- `TestCountryFiltering` - Country-based filtering
-- `TestASNFiltering` - ASN-based filtering (including exception logic)
-- `TestCombinedFiltering` - Multi-layer filtering combinations
-- `TestASNListFetching` - Remote/local ASN list loading and caching
-- `TestHealthEndpoint` - Health check functionality
-- `TestIPExtraction` - Client IP extraction from headers
-- `TestErrorHandling` - Graceful error handling
+- `TestConfigParsing` - Configuration loading and parsing
+- `TestIPMatcher` - Literal/CIDR/hostname IP matching
+- `TestVerification` - ForwardAuth filtering layers
+- `TestDomainConfig` - Domain overrides + wildcards
+- `TestHotReload` - Hot-reload safety
+- `TestAdminAPI` - Token-authed runtime edits
+- `TestHealth` - Health endpoints
+- `TestLint` - Config hygiene
+- `TestIPinfoLite` - Combined-DB provider
 
 ## Mocking Strategy
 
