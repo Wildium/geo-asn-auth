@@ -3,11 +3,14 @@ Geoblock Service - Flask application for IP/country/ASN-based access control.
 Provides ForwardAuth endpoint for Traefik reverse proxy.
 """
 
-import os
 import logging
-from flask import Flask, jsonify
+import os
+import signal
 
-from .config import Config
+from flask import Flask, jsonify, request
+
+from .admin_api import admin_bp, init_admin_api
+from .manager import ConfigManager
 from .verification import verify_request
 
 # Configure logging
@@ -27,23 +30,68 @@ werkzeug_logger.addFilter(HealthCheckFilter())
 # Initialize Flask app
 app = Flask(__name__)
 
-# Load configuration
-config = Config()
+# Live config with hot-reload support (issue #3)
+manager = ConfigManager()
+
+
+def _sighup_handler(signum, frame):
+    logger.info("SIGHUP received — reloading config")
+    manager.force_reload()
+
+
+try:
+    signal.signal(signal.SIGHUP, _sighup_handler)
+except (ValueError, AttributeError, OSError):
+    # Not on the main thread, or platform without SIGHUP (Windows) — mtime
+    # polling still covers hot-reload.
+    logger.debug("SIGHUP handler not installed (polling still active)")
+
+# Admin API (issue #4) — gated by ADMIN_TOKEN; disabled when unset
+init_admin_api(manager)
+app.register_blueprint(admin_bp, url_prefix='/admin')
 
 
 @app.route('/verify', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'])
 def verify():
     """ForwardAuth verification endpoint."""
-    return verify_request(config)
+    return verify_request(manager.current())
 
 
 @app.route('/health')
 def health():
-    """Health check endpoint."""
+    """
+    Minimal health check (issue #8): reveals no rule contents or counts.
+    Full config summary lives behind ADMIN_TOKEN at /health/detail.
+    """
+    status = manager.status()
+    cfg = manager.current()
+    return jsonify({
+        "status": "healthy" if status["config_loaded"] else "degraded",
+        "dbs_loaded": bool(cfg.geo_provider.country_available or cfg.geo_provider.asn_available),
+        "config_loaded": status["config_loaded"],
+        "last_reload": status["last_reload"],
+        "last_reload_error": status["last_reload_error"],
+    }), 200
+
+
+@app.route('/health/detail')
+def health_detail():
+    """Full config summary — requires ADMIN_TOKEN (issue #8)."""
+    token = os.getenv('ADMIN_TOKEN', '')
+    if not token:
+        return jsonify({"error": "detail endpoint disabled (no ADMIN_TOKEN)"}), 404
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer ') or auth[len('Bearer '):].strip() != token:
+        return jsonify({"error": "unauthorized"}), 401
+
+    config = manager.current()
     status = {
-        "status": "healthy",
-        "country_db": config.country_reader is not None,
-        "asn_db": config.asn_reader is not None,
+        "status": "healthy" if manager.status()["config_loaded"] else "degraded",
+        "geo_provider": config.geo_provider.name,
+        "country_db": config.geo_provider.country_available,
+        "asn_db": config.geo_provider.asn_available,
+        "reload": manager.status(),
+        "lint_warnings": config.lint_warnings,
         "config": {
             "ip_mode": config.ip_mode,
             "ip_whitelist_count": len(config.ip_whitelist),
@@ -63,6 +111,11 @@ def health():
         }
     }
     return jsonify(status), 200
+
+
+# Web admin UI (issue #5) — thin frontend over the admin API
+from .web_ui import register_ui_routes
+register_ui_routes(app)
 
 
 if __name__ == '__main__':

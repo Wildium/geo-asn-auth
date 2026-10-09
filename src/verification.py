@@ -127,6 +127,9 @@ def _check_user_agent(config):
 def _check_ip(client_ip, config):
     """
     Check IP whitelist/blacklist.
+
+    Entries may be literal IPs, CIDR networks, or hostnames (DDNS) —
+    matching is delegated to the config's IPMatcher (issue #7).
     
     Returns:
         Response tuple if request should be blocked/allowed, None to continue checks
@@ -140,10 +143,10 @@ def _check_ip(client_ip, config):
     
     # In blacklist mode: whitelist = bypass all checks, blacklist = immediate block
     if config.ip_mode == 'blacklist':
-        if config.ip_whitelist and client_ip in config.ip_whitelist:
+        if config.ip_whitelist and config.ip_whitelist_matcher.matches(client_ip):
             logger.info(f"Allowing IP {client_ip} (in IP whitelist, bypassing all checks)")
             return '', 200
-        if config.ip_blacklist and client_ip in config.ip_blacklist:
+        if config.ip_blacklist and config.ip_blacklist_matcher.matches(client_ip):
             logger.info(f"Blocked IP {client_ip} (in IP blacklist)")
             return render_block_page(
                 "Your IP address has been blocked.",
@@ -154,7 +157,7 @@ def _check_ip(client_ip, config):
     
     # In whitelist mode: only whitelisted IPs allowed (others continue to country/ASN checks)
     elif config.ip_mode == 'whitelist':
-        if config.ip_whitelist and client_ip in config.ip_whitelist:
+        if config.ip_whitelist and config.ip_whitelist_matcher.matches(client_ip):
             logger.info(f"Allowing IP {client_ip} (in IP whitelist)")
             return '', 200
         else:
@@ -177,13 +180,14 @@ def _check_country(client_ip, config):
     Returns:
         Response tuple if request should be blocked, None to continue checks
     """
-    if not config.country_reader or config.country_mode == 'disabled':
+    provider = config.geo_provider
+    if not provider.country_available or config.country_mode == 'disabled':
         return None
     
     try:
-        country_response = config.country_reader.country(client_ip)
-        country_code = country_response.country.iso_code
-        country_name = country_response.country.name
+        info = provider.country_lookup(client_ip)
+        country_code = info['iso_code']
+        country_name = info['name']
         
         # Whitelist mode: only allow listed countries
         if config.country_mode == 'whitelist' and config.country_whitelist:
@@ -227,13 +231,14 @@ def _check_asn(client_ip, config):
     Returns:
         Response tuple if request should be blocked, None to continue checks
     """
-    if not config.asn_reader or config.asn_mode == 'disabled':
+    provider = config.geo_provider
+    if not provider.asn_available or config.asn_mode == 'disabled':
         return None
     
     try:
-        asn_response = config.asn_reader.asn(client_ip)
-        asn_number = asn_response.autonomous_system_number
-        asn_org = asn_response.autonomous_system_organization
+        info = provider.asn_lookup(client_ip)
+        asn_number = info['number']
+        asn_org = info['org']
         
         # Whitelist mode: only allow listed ASNs (strict mode)
         if config.asn_mode == 'whitelist':

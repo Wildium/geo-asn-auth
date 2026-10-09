@@ -1,14 +1,25 @@
 """
 Configuration management for geoblock service.
-Handles loading, parsing, and validating configuration from YAML files.
+Handles loading, parsing, validating, and linting configuration from YAML files.
+
+IP list entries support three forms (issue #7):
+- literal IP:            "71.218.154.144"
+- CIDR network:          "10.0.0.0/8"
+- hostname (DDNS):       "home.example.com"  (resolved with TTL cache)
 """
 
-import os
+import ipaddress
 import logging
-import yaml
+import os
 import re
-import geoip2.database
+import fnmatch
+import socket
+import time
+
+import yaml
+
 from .blocklist_fetcher import fetch_asn_list
+from .geo_providers import create_provider, IPINFO_LITE_DB_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +29,88 @@ CONFIG_EXAMPLE_PATH = '/app/config.example.yaml'
 COUNTRY_DB_PATH = os.getenv('COUNTRY_DB_PATH', '/data/GeoLite2-Country.mmdb')
 ASN_DB_PATH = os.getenv('ASN_DB_PATH', '/data/GeoLite2-ASN.mmdb')
 
+# Default TTL (seconds) for hostname (DDNS) resolution in IP lists
+DNS_TTL = int(os.getenv('DNS_TTL', '60'))
+
+
+class HostnameResolver:
+    """Resolve hostnames to IPs with a TTL cache (for DDNS entries)."""
+
+    def __init__(self, ttl=None):
+        self.ttl = ttl if ttl is not None else DNS_TTL
+        self._cache = {}  # hostname -> (resolved_set, timestamp)
+
+    def resolve(self, hostname):
+        now = time.monotonic()
+        entry = self._cache.get(hostname)
+        if entry and (now - entry[1]) < self.ttl:
+            return entry[0]
+        try:
+            infos = socket.getaddrinfo(hostname, None)
+            ips = {info[4][0] for info in infos}
+        except (socket.gaierror, UnicodeError) as e:
+            logger.warning(f"DNS lookup failed for '{hostname}': {e}")
+            # Serve stale on failure (better than locking out on a transient DNS blip)
+            return entry[0] if entry else set()
+        self._cache[hostname] = (ips, now)
+        return ips
+
+
+class IPMatcher:
+    """
+    Match client IPs against a set of entries that may be literal IPs,
+    CIDR networks, or hostnames (resolved with TTL cache).
+    """
+
+    def __init__(self, entries, resolver=None):
+        self.entries = set(entries)
+        self.exact = set()
+        self.networks = []
+        self.hostnames = set()
+        self.resolver = resolver or HostnameResolver()
+        for entry in self.entries:
+            entry = str(entry).strip()
+            if not entry:
+                continue
+            if '/' in entry:
+                try:
+                    self.networks.append(ipaddress.ip_network(entry, strict=False))
+                    continue
+                except ValueError:
+                    logger.warning(f"Invalid CIDR entry: {entry}")
+                    continue
+            try:
+                self.exact.add(str(ipaddress.ip_address(entry)))
+            except ValueError:
+                # Not an IP or CIDR — treat as hostname (DDNS)
+                self.hostnames.add(entry.lower())
+
+    def matches(self, ip_str):
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+        if str(ip) in self.exact:
+            return True
+        for net in self.networks:
+            if ip in net:
+                return True
+        for hostname in self.hostnames:
+            if str(ip) in self.resolver.resolve(hostname):
+                return True
+        return False
+
 
 class Config:
     """Configuration container for geoblock service."""
     
-    def __init__(self):
-        """Initialize and load configuration."""
+    def __init__(self, config_path=None):
+        """Initialize and load configuration.
+
+        config_path: explicit YAML path (used by ConfigManager for hot-reload).
+        Falls back to the CONFIG_PATH env / module default when omitted.
+        """
+        self._config_path = config_path
         # Load YAML config
         self.raw_config = self._load_yaml_config()
         
@@ -33,12 +120,16 @@ class Config:
         self.allow_unknown = os.getenv('ALLOW_UNKNOWN', str(settings.get('allow_unknown', True))).lower() == 'true'
         self.use_html_response = os.getenv('USE_HTML_RESPONSE', str(settings.get('use_html_response', True))).lower() == 'true'
         self.cache_hours = int(os.getenv('CACHE_HOURS', str(settings.get('cache_hours', 168))))
+        dns_ttl = int(os.getenv('DNS_TTL', str(settings.get('dns_ttl', DNS_TTL))))
+        self.resolver = HostnameResolver(ttl=dns_ttl)
         
         # Parse IP configuration
         ip_config = self.raw_config.get('ip', {})
         self.ip_mode = ip_config.get('mode', 'disabled')
         self.ip_whitelist = set(ip_config.get('whitelist', []))
         self.ip_blacklist = set(ip_config.get('blacklist', []))
+        self.ip_whitelist_matcher = IPMatcher(self.ip_whitelist, self.resolver)
+        self.ip_blacklist_matcher = IPMatcher(self.ip_blacklist, self.resolver)
         
         # Parse user-agent configuration (requires cache_hours)
         self._parse_user_agent_config(self.raw_config.get('user_agent', {}))
@@ -78,6 +169,9 @@ class Config:
         # Validate configuration
         self._validate_config()
         
+        # Lint configuration (non-fatal warnings, issue #6)
+        self.lint_warnings = self._lint_config()
+        
         # Parse domain-specific configurations
         self.domain_configs = {}
         domains = self.raw_config.get('domains', {})
@@ -90,12 +184,26 @@ class Config:
                 except Exception as e:
                     logger.error(f"Failed to parse domain config for {domain}: {e}")
         
-        # Load GeoIP databases
-        self.country_reader = self._load_country_db()
-        self.asn_reader = self._load_asn_db()
+        # Load geo provider (MaxMind default, or IPinfo Lite combined DB)
+        self.geo_provider = create_provider(
+            self.raw_config.get('geoip', {}),
+            COUNTRY_DB_PATH,
+            ASN_DB_PATH,
+            IPINFO_LITE_DB_PATH,
+        )
+        # Back-compat attributes (tests / health)
+        self.country_reader = getattr(self.geo_provider, 'country_reader', None)
+        self.asn_reader = getattr(self.geo_provider, 'asn_reader', None)
         
         # Log configuration
         self._log_config()
+    
+    def close(self):
+        """Release database handles (called on hot-reload swap)."""
+        try:
+            self.geo_provider.close()
+        except Exception:
+            pass
     
     def _parse_domain_config(self, domain, domain_config):
         """
@@ -180,6 +288,9 @@ class Config:
                 # Replace: use only domain config
                 domain_obj.ip_whitelist = set(ip_config.get('whitelist', []))
                 domain_obj.ip_blacklist = set(ip_config.get('blacklist', []))
+            # Rebuild matchers for the new entry sets
+            domain_obj.ip_whitelist_matcher = IPMatcher(domain_obj.ip_whitelist, self.resolver)
+            domain_obj.ip_blacklist_matcher = IPMatcher(domain_obj.ip_blacklist, self.resolver)
         
         # Apply country overrides
         if 'countries' in overrides:
@@ -262,8 +373,8 @@ class Config:
     
     def _load_yaml_config(self):
         """Load configuration from YAML file."""
-        # Try custom config first, then fall back to example
-        config_paths = [CONFIG_PATH, CONFIG_EXAMPLE_PATH]
+        # Explicit path (from ConfigManager) wins, then env default, then example
+        config_paths = [self._config_path or CONFIG_PATH, CONFIG_EXAMPLE_PATH]
         
         for path in config_paths:
             try:
@@ -274,6 +385,7 @@ class Config:
                         return config
             except Exception as e:
                 logger.error(f"Failed to load config from {path}: {e}")
+                raise
         
         logger.warning("No config file found, using empty defaults")
         return {}
@@ -377,46 +489,87 @@ class Config:
     
     def _validate_config(self):
         """Validate configuration settings."""
-        # This condition can never be true (same variable), but keeping for consistency
-        if self.country_mode == 'whitelist' and self.country_mode == 'blacklist':
-            logger.error("Country mode cannot be both whitelist and blacklist")
-            raise ValueError("Set country mode to either 'whitelist', 'blacklist', or 'disabled'")
+        valid_modes = ('whitelist', 'blacklist', 'disabled')
+        for name, mode in (('country', self.country_mode), ('asn', self.asn_mode),
+                           ('ip', self.ip_mode), ('user_agent', self.user_agent_mode)):
+            if mode not in valid_modes:
+                raise ValueError(
+                    f"Set {name} mode to one of {valid_modes}, got '{mode}'"
+                )
+    
+    def _lint_config(self):
+        """
+        Non-fatal config hygiene checks (issue #6). Returns a list of warning
+        strings. Also logged at startup. Contradictions and footguns are
+        surfaced without breaking behavior.
+        """
+        warnings = []
         
-        if self.asn_mode == 'whitelist' and self.asn_mode == 'blacklist':
-            logger.error("ASN mode cannot be both whitelist and blacklist")
-            raise ValueError("Set ASN mode to either 'whitelist', 'blacklist', or 'disabled'")
+        # ASN in both whitelist and blacklist
+        asn_overlap = set(self.asn_whitelist.keys()) & set(self.asn_blacklist)
+        if asn_overlap:
+            warnings.append(
+                f"ASN(s) in BOTH asn.whitelist and asn.blacklist: {sorted(asn_overlap)}. "
+                "Whitelist wins (blacklist exception); if intentional, add a comment, "
+                "otherwise remove one side."
+            )
+        
+        # Country in both lists
+        country_overlap = set(self.country_whitelist) & set(self.country_blacklist)
+        if country_overlap:
+            warnings.append(
+                f"Country code(s) in BOTH countries.whitelist and countries.blacklist: "
+                f"{sorted(country_overlap)}."
+            )
+        
+        # IP in both lists
+        ip_overlap = self.ip_whitelist & self.ip_blacklist
+        if ip_overlap:
+            warnings.append(
+                f"IP entry(ies) in BOTH ip.whitelist and ip.blacklist: {sorted(ip_overlap)}."
+            )
+        
+        # Overly broad user-agent substrings
+        broad = {'bot', 'crawler', 'spider', 'crawl'}
+        ua_blacklist = set()
+        if self.user_agent_mode == 'blacklist' and self.user_agent_blacklist_regex:
+            # Recover manual entries from raw config for linting (remote lists
+            # are curated; manual broad entries are the footgun)
+            ua_blacklist = {str(e).lower() for e in
+                            self.raw_config.get('user_agent', {}).get('blacklist', [])}
+        broad_hits = ua_blacklist & broad
+        if broad_hits:
+            warnings.append(
+                f"User-agent blacklist contains broad substring(s) {sorted(broad_hits)} — "
+                "substring match blocks any UA containing them (e.g. 'robot', 'Abbott'). "
+                "Narrow the pattern (e.g. 'bot/' or a full UA) or rely on the curated "
+                "remote bad-bot list instead."
+            )
+        
+        # Whitelist mode with empty list = block everything
+        if self.country_mode == 'whitelist' and not self.country_whitelist:
+            warnings.append("countries.mode=whitelist but countries.whitelist is empty — all country lookups will block.")
+        if self.asn_mode == 'whitelist' and not self.asn_whitelist:
+            warnings.append("asn.mode=whitelist but asn.whitelist is empty — all ASN lookups will block.")
+        if self.ip_mode == 'whitelist' and not self.ip_whitelist:
+            warnings.append("ip.mode=whitelist but ip.whitelist is empty — all IPs will block.")
+        
+        for w in warnings:
+            logger.warning(f"CONFIG LINT: {w}")
+        return warnings
     
     def _load_country_db(self):
-        """Load GeoIP2 Country database."""
-        try:
-            if os.path.exists(COUNTRY_DB_PATH):
-                reader = geoip2.database.Reader(COUNTRY_DB_PATH)
-                logger.info(f"Loaded Country database from {COUNTRY_DB_PATH}")
-                return reader
-            else:
-                logger.warning(f"Country database not found at {COUNTRY_DB_PATH}")
-                return None
-        except Exception as e:
-            logger.error(f"Failed to load Country database: {e}")
-            return None
+        """Deprecated: kept for back-compat; provider handles DB loading."""
+        return getattr(self.geo_provider, 'country_reader', None)
     
     def _load_asn_db(self):
-        """Load GeoIP2 ASN database."""
-        try:
-            if os.path.exists(ASN_DB_PATH):
-                reader = geoip2.database.Reader(ASN_DB_PATH)
-                logger.info(f"Loaded ASN database from {ASN_DB_PATH}")
-                return reader
-            else:
-                logger.warning(f"ASN database not found at {ASN_DB_PATH}")
-                return None
-        except Exception as e:
-            logger.error(f"Failed to load ASN database: {e}")
-            return None
+        """Deprecated: kept for back-compat; provider handles DB loading."""
+        return getattr(self.geo_provider, 'asn_reader', None)
     
     def _log_config(self):
         """Log configuration details."""
         logger.info("Configuration:")
+        logger.info(f"  Geo provider: {self.geo_provider.name}")
         logger.info(f"  Country mode: {self.country_mode}")
         logger.info(f"  Country whitelist: {self.country_whitelist}")
         logger.info(f"  Country blacklist: {self.country_blacklist}")
@@ -430,10 +583,84 @@ class Config:
         logger.info(f"  IP blacklist: {self.ip_blacklist}")
         logger.info(f"  ASN whitelist: {len(self.asn_whitelist)} total, "
                    f"{sum(1 for p in self.asn_whitelist.values() if p)} conditional")
-        logger.info(f"  ASN blacklist: {self.asn_blacklist}")
+        logger.info(f"  ASN blacklist: {len(self.asn_blacklist)} entries")
         logger.info(f"  ALLOW_LAN: {self.allow_lan}")
         logger.info(f"  ALLOW_UNKNOWN: {self.allow_unknown}")
+        if self.lint_warnings:
+            logger.warning(f"  Config lint: {len(self.lint_warnings)} warning(s) — see above")
         if self.domain_configs:
             logger.info(f"  Domain-specific configs: {len(self.domain_configs)} domain(s)")
             for domain in self.domain_configs.keys():
                 logger.info(f"    - {domain}")
+
+
+def lint_config_file(path):
+    """
+    Lint a config file without starting the service (issue #6).
+    Returns (warnings, errors). Errors are fatal (invalid modes/YAML).
+    """
+    warnings, errors = [], []
+    try:
+        with open(path, 'r') as f:
+            raw = yaml.safe_load(f)
+    except Exception as e:
+        return warnings, [f"YAML parse error: {e}"]
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        return warnings, ["Config root must be a mapping"]
+
+    valid_modes = ('whitelist', 'blacklist', 'disabled')
+    for section in ('ip', 'countries', 'asn', 'user_agent'):
+        mode = (raw.get(section) or {}).get('mode', 'disabled')
+        if mode not in valid_modes:
+            errors.append(f"{section}.mode='{mode}' is not one of {valid_modes}")
+
+    asn_cfg = raw.get('asn') or {}
+    wl = set()
+    for entry in asn_cfg.get('whitelist', []) or []:
+        if isinstance(entry, int):
+            wl.add(entry)
+        elif isinstance(entry, dict) and 'asn' in entry:
+            wl.add(entry['asn'])
+    bl = set(asn_cfg.get('blacklist', []) or [])
+    overlap = wl & bl
+    if overlap:
+        warnings.append(f"ASN(s) in both asn.whitelist and asn.blacklist: {sorted(overlap)}")
+
+    c_cfg = raw.get('countries') or {}
+    c_overlap = {c.upper() for c in c_cfg.get('whitelist', []) or []} & \
+                {c.upper() for c in c_cfg.get('blacklist', []) or []}
+    if c_overlap:
+        warnings.append(f"Country code(s) in both lists: {sorted(c_overlap)}")
+
+    i_cfg = raw.get('ip') or {}
+    i_overlap = set(i_cfg.get('whitelist', []) or []) & set(i_cfg.get('blacklist', []) or [])
+    if i_overlap:
+        warnings.append(f"IP entry(ies) in both lists: {sorted(i_overlap)}")
+
+    ua_cfg = raw.get('user_agent') or {}
+    broad = {'bot', 'crawler', 'spider', 'crawl'}
+    broad_hits = {str(e).lower() for e in ua_cfg.get('blacklist', []) or []} & broad
+    if broad_hits:
+        warnings.append(
+            f"Broad user-agent substring(s) {sorted(broad_hits)} — substring match has "
+            "false-positive risk; narrow or rely on the curated remote list."
+        )
+
+    return warnings, errors
+
+
+if __name__ == '__main__':
+    import sys
+    target = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == '--lint' else \
+             sys.argv[1] if len(sys.argv) > 1 else CONFIG_PATH
+    warns, errs = lint_config_file(target)
+    for w in warns:
+        print(f"WARN: {w}")
+    for e in errs:
+        print(f"ERROR: {e}")
+    if errs:
+        print(f"\n{len(errs)} error(s), {len(warns)} warning(s) in {target}")
+        sys.exit(1)
+    print(f"OK: {target} valid ({len(warns)} warning(s))")

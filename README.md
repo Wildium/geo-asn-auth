@@ -144,12 +144,17 @@ user_agent:
 - **Country-based blocking** (whitelist or blacklist)
 - **ASN-based blocking** (whitelist or blacklist)
 - **User-agent filtering** (blacklist with substring matching)
-- Supports MaxMind GeoLite2 Country and ASN databases
+- **IP filtering** with literal IPs, **CIDR ranges**, and **hostnames/DDNS** (resolved with a TTL cache — a rotating residential IP keeps working without a config edit)
+- Supports MaxMind GeoLite2 Country and ASN databases, **or a single combined IPinfo Lite database** (country + ASN in one file, updated daily, CC-BY-SA 4.0)
 - Remote blocklist fetching with caching
+- **Hot-reload** — edit `config.yaml` (or send `SIGHUP`) and new rules go live in ~2s with zero dropped requests; a malformed config never breaks the running service
+- **Token-authed admin API** for runtime rule edits over HTTPS (agent-operable — no shell access needed)
+- **Built-in web admin UI** (thin frontend over the admin API)
+- **Config lint** — surfaces contradictions and footguns (e.g. an ASN in both lists, an overly broad user-agent substring)
 - YAML configuration file with inline comments
 - Private IP allowance option
-- Health check endpoint
-- Detailed logging
+- Health check endpoint (minimal by default; full summary behind the admin token)
+- Detailed logging + an audit log for admin edits
 - Configurable service port
 
 ![Screenshot](docs/images/country-block.png)
@@ -275,6 +280,10 @@ environment:
   - CONFIG_PATH=/app/config.yaml
   - COUNTRY_DB_PATH=/data/GeoLite2-Country.mmdb
   - ASN_DB_PATH=/data/GeoLite2-ASN.mmdb
+  - ADMIN_TOKEN=***           # Enables the admin API + web UI (unset = disabled)
+  - DNS_TTL=60                     # TTL (s) for hostname/DDNS entries in IP lists
+  - CONFIG_POLL_INTERVAL=2         # Config file poll interval (s) for hot-reload
+  - AUDIT_LOG_PATH=/blocklists/audit.log  # Admin edit audit log location
 ```
 
 ## Filtering Modes
@@ -574,7 +583,97 @@ caddy reload  # Or: docker exec caddy caddy reload
 ## Endpoints
 
 - `GET /verify` - ForwardAuth verification (used by Traefik)
-- `GET /health` - Health check and configuration status
+- `GET /health` - Minimal health check (status + DB/reload state; reveals no rule contents)
+- `GET /health/detail` - Full config summary (requires `ADMIN_TOKEN` Bearer auth)
+- `GET /admin/config` - Current effective config + lint warnings (admin token)
+- `GET|PUT /admin/{section}` - Read/edit a rule list (admin token). Sections: `ip-whitelist`, `ip-blacklist`, `asn-whitelist`, `asn-blacklist`, `country-whitelist`, `country-blacklist`, `user-agent-whitelist`, `user-agent-blacklist`
+- `POST /admin/reload` - Force a config reload (admin token)
+- `GET /admin/ui` - Built-in web admin UI (token entered in-browser)
+
+## Hot-Reload
+
+Config is watched continuously (mtime poll, ~2s) and reloaded on `SIGHUP`. Editing `config.yaml` makes new rules live within seconds **without restarting the container** — no dropped ForwardAuth requests.
+
+- On a reload failure (malformed YAML, invalid mode), the service **keeps serving the last-good config** and logs the error. It never fails-open or crashes on a typo.
+- `/health` reports `last_reload` and `last_reload_error` so you can see reload status.
+- Remote blocklists are only re-fetched when their cache expires (reload doesn't hammer blocklist URLs).
+
+```bash
+docker kill --signal=SIGHUP geo-asn-auth   # force an immediate reload
+```
+
+## Admin API (runtime rule edits)
+
+Set an `ADMIN_TOKEN` environment variable to enable the admin API. Without it, all `/admin/*` routes return 404 (fail closed). All admin calls use `Authorization: Bearer <ADMIN_TOKEN>`.
+
+The write path is safe: **validate → auto-backup (`config.yaml.bak-<ts>`) → atomic write → hot-reload → audit log entry**. A failed reload rolls the file back.
+
+```bash
+# Add a VPN ASN to the blacklist exception list, live in <5s:
+curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"add": [212238]}' \
+  http://localhost:9876/admin/asn-whitelist
+
+# Remove an entry:
+curl -X PUT -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"remove": [9009]}' \
+  http://localhost:9876/admin/asn-blacklist
+```
+
+This makes the blocker **agent-operable**: an AI assistant managing your homelab can whitelist the next rotating VPN ASN itself, over HTTPS, without shell access.
+
+> **Security:** the admin paths must be excluded from your proxy's own ForwardAuth loop (or protected by a separate identity) to avoid auth recursion. Serve the UI on a management-only domain, never a public one. Edits are rate-limit-friendly but audited (`/blocklists/audit.log` by default, `AUDIT_LOG_PATH` to override).
+
+## Web Admin UI
+
+With `ADMIN_TOKEN` set, visit `/admin/ui` for a single-page dashboard: view modes and rule counts, add/remove IP, ASN (including conditional user-agent entries), country, and user-agent rules, with a diff-free validate-before-save. It is strictly a frontend over the admin API — there is no separate config-write path.
+
+## Config Lint
+
+On startup (and via `GET /admin/config`) the service lints its own config and logs warnings for contradictions and footguns:
+
+- An ASN (or country/IP) present in **both** whitelist and blacklist
+- Overly broad user-agent substrings like `bot`/`crawler` (substring match false-positives on e.g. "robot", "Abbott")
+- A `whitelist` mode with an empty list (would block everything)
+
+You can also lint a file without starting the service:
+
+```bash
+python -m src.config --lint /path/to/config.yaml
+```
+
+## Hostname / CIDR IP Entries
+
+IP whitelist/blacklist entries accept three forms:
+
+```yaml
+ip:
+  mode: whitelist
+  whitelist:
+    - "71.218.154.144"     # literal IP
+    - "10.0.0.0/8"         # CIDR range
+    - "home.example.com"   # DDNS hostname — resolved + cached (dns_ttl, default 60s)
+```
+
+A DDNS hostname means a rotating residential IP no longer requires a config edit to keep admin access. Set `settings.dns_ttl` to control the resolution cache.
+
+## IPinfo Lite Provider
+
+By default the service uses MaxMind GeoLite2 (separate Country + ASN databases). You can instead use a single combined **IPinfo Lite** database (country + ASN per record, updated daily, CC-BY-SA 4.0):
+
+```bash
+curl -L "https://ipinfo.io/data/ipinfo_lite.mmdb?token=$IPINFO_TOKEN" -o ipinfo_lite.mmdb
+```
+
+```yaml
+geoip:
+  provider: ipinfo-lite
+  ipinfo_lite_db: /data/ipinfo_lite.mmdb
+```
+
+Mount the file into the container (e.g. `- ./config/maxmind:/data:ro`) and point `ipinfo_lite_db` at it. This replaces the two MaxMind files with one, simplifying the compose volume setup.
 
 ## Testing
 
