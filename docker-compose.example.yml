@@ -20,6 +20,8 @@ services:
       # - ./geoblock/config.yaml:/app/config.yaml:ro
       # Mount blocklists directory for caching and custom ASN lists
       - ./geoblock/blocklists:/blocklists
+      # Custom block page (optional - replaces the bundled "Access Denied" page)
+      # - ./geoblock/block_page.html:/app/block_page.html:ro
     # All environment variables are optional - defaults shown below
     # Uncomment and modify only if you need to override defaults
     # environment:

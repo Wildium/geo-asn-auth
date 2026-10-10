@@ -129,6 +129,7 @@ settings:
   allow_unknown: true      # Allow if country/ASN cannot be determined
   use_html_response: true  # Return HTML block page (false for JSON response)
   block_status: 403        # HTTP status on block: 403 (default) or 404 (hide that the route exists)
+  # block_page: /app/block_page.html  # Path to custom HTML block page (supports {{reason}}, {{client_ip}}, {{country}}, {{asn}}, {{timestamp}}, {{request_id}})
   cache_hours: 168         # Cache duration for remote ASN lists (default: 168 hours = 7 days)
   dns_ttl: 60              # TTL (seconds) for hostname/DDNS entries in IP lists
 

@@ -5,6 +5,7 @@ Utility functions for IP handling and response rendering.
 import ipaddress
 import uuid
 import re
+import html
 import logging
 from datetime import datetime
 from flask import request, jsonify, Response
@@ -75,31 +76,36 @@ def render_block_page(reason, client_ip, country=None, asn=None,
     """
     request_id = str(uuid.uuid4())[:8]
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    # Log the same id the client sees, so a support request quoting the
+    # block page can be matched in the logs.
+    logger.info(f"Blocked {client_ip}: {reason} (request_id={request_id})")
     
     # Return JSON if HTML is disabled or template not loaded
     if not use_html_response or not block_page_template:
         return jsonify({"error": reason, "ip": client_ip, "request_id": request_id}), status
     
-    # Render HTML template
-    html = block_page_template
-    html = html.replace('{{reason}}', reason)
-    html = html.replace('{{client_ip}}', client_ip)
-    html = html.replace('{{timestamp}}', timestamp)
-    html = html.replace('{{request_id}}', request_id)
+    # Render HTML template. Values are HTML-escaped: client_ip comes from
+    # X-Forwarded-For (attacker-controlled), so raw substitution is XSS.
+    esc = html.escape
+    html_out = block_page_template
+    html_out = html_out.replace('{{reason}}', esc(reason))
+    html_out = html_out.replace('{{client_ip}}', esc(client_ip))
+    html_out = html_out.replace('{{timestamp}}', esc(timestamp))
+    html_out = html_out.replace('{{request_id}}', esc(request_id))
     
     # Handle optional fields with simple template logic
     if country:
-        html = html.replace('{{#country}}', '').replace('{{/country}}', '')
-        html = html.replace('{{country}}', country)
+        html_out = html_out.replace('{{#country}}', '').replace('{{/country}}', '')
+        html_out = html_out.replace('{{country}}', esc(country))
     else:
         # Remove conditional section
-        html = re.sub(r'{{#country}}.*?{{/country}}', '', html, flags=re.DOTALL)
+        html_out = re.sub(r'{{#country}}.*?{{/country}}', '', html_out, flags=re.DOTALL)
     
     if asn:
-        html = html.replace('{{#asn}}', '').replace('{{/asn}}', '')
-        html = html.replace('{{asn}}', str(asn))
+        html_out = html_out.replace('{{#asn}}', '').replace('{{/asn}}', '')
+        html_out = html_out.replace('{{asn}}', esc(str(asn)))
     else:
         # Remove conditional section
-        html = re.sub(r'{{#asn}}.*?{{/asn}}', '', html, flags=re.DOTALL)
+        html_out = re.sub(r'{{#asn}}.*?{{/asn}}', '', html_out, flags=re.DOTALL)
     
-    return Response(html, status=status, mimetype='text/html')
+    return Response(html_out, status=status, mimetype='text/html')

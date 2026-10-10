@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_PATH = '/app/config.yaml'
 CONFIG_PATH = os.getenv('CONFIG_PATH', DEFAULT_CONFIG_PATH)
 CONFIG_EXAMPLE_PATH = '/app/config.example.yaml'
+BLOCK_PAGE_PATH = '/app/block_page.html'
 COUNTRY_DB_PATH = os.getenv('COUNTRY_DB_PATH', '/data/GeoLite2-Country.mmdb')
 ASN_DB_PATH = os.getenv('ASN_DB_PATH', '/data/GeoLite2-ASN.mmdb')
 
@@ -511,14 +512,22 @@ class Config:
             logger.info(f"Total ASN whitelist size: {len(self.asn_whitelist)}")
     
     def _load_html_template(self):
-        """Load HTML block page template."""
+        """Load HTML block page template.
+
+        Path is BLOCK_PAGE_PATH env or settings.block_page (default
+        /app/block_page.html). A missing/unreadable file falls back to JSON
+        block responses with a loud warning (service keeps working, just
+        without the HTML page).
+        """
+        settings = self.raw_config.get('settings', {})
+        path = os.getenv('BLOCK_PAGE_PATH', settings.get('block_page', BLOCK_PAGE_PATH))
         try:
-            with open('/app/block_page.html', 'r') as f:
+            with open(path, 'r') as f:
                 template = f.read()
-            logger.info("Loaded HTML block page template")
+            logger.info(f"Loaded HTML block page template from {path}")
             return template
         except Exception as e:
-            logger.warning(f"Could not load HTML template: {e}, using JSON responses only")
+            logger.warning(f"Could not load HTML template {path}: {e}, using JSON responses only")
             return None
     
     @staticmethod

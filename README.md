@@ -277,6 +277,7 @@ environment:
   - ALLOW_LAN=true                 # Allow private/LAN IPs
   - ALLOW_UNKNOWN=true             # Allow when geo data unavailable
   - BLOCK_STATUS=403               # HTTP status on block: 403 (default) or 404
+  - BLOCK_PAGE_PATH=/app/block_page.html  # Custom HTML block page (missing file -> JSON responses)
   - CACHE_HOURS=168                # Blocklist cache duration (default: 7 days)
   - CONFIG_PATH=/app/config.yaml
   - COUNTRY_DB_PATH=/data/GeoLite2-Country.mmdb
@@ -306,6 +307,35 @@ domains:
 ```
 
 The block page (HTML or JSON, see `use_html_response`) carries the configured status; the default HTML page is status-neutral ("Access Denied") so it works for either.
+
+### Custom Block Page
+
+The bundled page is a template, not hardcoded markup. Replace it wholesale by pointing at your own file:
+
+```yaml
+settings:
+  block_page: /app/block_page.html   # or BLOCK_PAGE_PATH env var
+```
+
+or mount over the bundled file (no rebuild):
+
+```yaml
+volumes:
+  - ./geoblock/block_page.html:/app/block_page.html:ro
+```
+
+Your HTML can use these placeholders (all HTML-escaped before insertion):
+
+| Placeholder | Value |
+|---|---|
+| `{{reason}}` | Why the request was blocked |
+| `{{client_ip}}` | Client IP (from X-Forwarded-For) |
+| `{{country}}` | Country name — wrap in `{{#country}}...{{/country}}` to hide when unknown |
+| `{{asn}}` | ASN — wrap in `{{#asn}}...{{/asn}}` to hide when unknown |
+| `{{timestamp}}` | Block time (UTC) |
+| `{{request_id}}` | Short ID matching the one in logs, for support lookups |
+
+If the configured page is missing or unreadable, the service logs a warning and falls back to JSON block responses — it never fails to start over a missing page.
 
 ## Filtering Modes
 

@@ -531,6 +531,48 @@ domains:
 
 
 # ---------------------------------------------------------------------- #
+# Block page: custom path + XSS escaping
+# ---------------------------------------------------------------------- #
+class TestBlockPage:
+    def test_custom_page_via_yaml(self, make_config, tmp_path):
+        page = tmp_path / 'custom.html'
+        page.write_text('<h1>NOPE {{reason}}</h1>')
+        cfg = make_config(f"settings:\n  block_page: {page}\n")
+        assert cfg.block_page_template == '<h1>NOPE {{reason}}</h1>'
+
+    def test_custom_page_via_env(self, make_config, tmp_path, monkeypatch):
+        page = tmp_path / 'env.html'
+        page.write_text('<h1>env page</h1>')
+        monkeypatch.setenv('BLOCK_PAGE_PATH', str(page))
+        cfg = make_config("settings:\n  allow_lan: true\n")
+        assert cfg.block_page_template == '<h1>env page</h1>'
+
+    def test_missing_page_falls_back_to_json(self, make_config, tmp_path):
+        cfg = make_config(f"settings:\n  block_page: {tmp_path / 'gone.html'}\n")
+        assert cfg.block_page_template is None  # render_block_page -> JSON
+
+    def test_xss_in_client_ip_escaped(self):
+        """client_ip comes from X-Forwarded-For (attacker-controlled).
+        Raw substitution put scripts into our own block page."""
+        from src.utils import render_block_page
+        tmpl = '<p>{{client_ip}}</p>{{#country}}<p>{{country}}</p>{{/country}}'
+        evil = '<script>alert(1)</script>'
+        r = render_block_page('blocked', evil, country=evil,
+                              use_html_response=True, block_page_template=tmpl)
+        body = r.get_data(as_text=True)
+        assert '<script>' not in body
+        assert '&lt;script&gt;' in body
+
+    def test_reason_escaped(self):
+        from src.utils import render_block_page
+        tmpl = '<p>{{reason}}</p>'
+        r = render_block_page('ua <b>evil</b>"x', '1.2.3.4',
+                              use_html_response=True, block_page_template=tmpl)
+        body = r.get_data(as_text=True)
+        assert '<b>' not in body
+
+
+# ---------------------------------------------------------------------- #
 # Downstream hardening: UI gating + per-IP auth throttle
 # ---------------------------------------------------------------------- #
 class TestAdminHardening:
