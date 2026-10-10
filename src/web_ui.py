@@ -7,6 +7,7 @@ sessionStorage, and uses it as a Bearer token for all admin API calls.
 """
 
 from flask import Response
+import os
 
 UI_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -58,6 +59,7 @@ UI_HTML = r"""<!DOCTYPE html>
 </header>
 <main>
   <div id="status" class="status"></div>
+  <div class="warn">Edits here rewrite <code>config.yaml</code> (validate &rarr; backup &rarr; atomic write &rarr; hot-reload). Comments and custom formatting in the file are not preserved. For comment-heavy configs, edit the file directly instead.</div>
   <div id="warns"></div>
   <div class="grid" id="grid"></div>
 </main>
@@ -160,4 +162,8 @@ loadAll();
 def register_ui_routes(app):
     @app.route('/admin/ui')
     def admin_ui():
+        # Fail closed like the admin API: with no ADMIN_TOKEN the UI is
+        # pointless (every call behind it 404s), so don't advertise it.
+        if not os.getenv('ADMIN_TOKEN', ''):
+            return Response("Not found", status=404)
         return Response(UI_HTML, mimetype='text/html')

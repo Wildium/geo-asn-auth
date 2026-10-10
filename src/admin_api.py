@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
 
 import yaml
@@ -32,6 +33,55 @@ admin_bp = Blueprint('admin', __name__)
 _manager = None
 _audit_path = None
 
+# ---------------------------------------------------------------------- #
+# Per-IP throttle on failed admin auth (brute-force backstop).
+# Counts only 401/404 auth failures, not successful calls, so a legitimate
+# admin is never rate-limited. In-memory and per-worker: a strong token makes
+# this a belt-and-braces control, not the primary one.
+# ---------------------------------------------------------------------- #
+_FAIL_WINDOW_S = int(os.getenv('ADMIN_FAIL_WINDOW_S', '60'))
+_FAIL_MAX = int(os.getenv('ADMIN_FAIL_MAX', '10'))
+_fail_counts = {}          # ip -> [timestamps of failures within window]
+_fail_lock = threading.Lock()
+
+
+def _client_ip():
+    """Best-effort client IP for throttling. XFF is spoofable, but poisoning
+    a throttle bucket only harms the attacker's own access — this is not an
+    auth decision, so best-effort is acceptable."""
+    xff = request.headers.get('X-Forwarded-For', '')
+    if xff:
+        return xff.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def _throttled(ip):
+    """True if this IP has exceeded the failure budget in the window.
+    Returns (throttled, retry_after_s)."""
+    now = time.monotonic()
+    cutoff = now - _FAIL_WINDOW_S
+    with _fail_lock:
+        stamps = [t for t in _fail_counts.get(ip, ()) if t >= cutoff]
+        if len(stamps) >= _FAIL_MAX:
+            _fail_counts[ip] = stamps
+            retry = int(_FAIL_WINDOW_S - (now - stamps[0])) + 1
+            return True, max(retry, 1)
+        return False, 0
+
+
+def _record_failure(ip):
+    now = time.monotonic()
+    cutoff = now - _FAIL_WINDOW_S
+    with _fail_lock:
+        stamps = [t for t in _fail_counts.get(ip, ()) if t >= cutoff]
+        stamps.append(now)
+        _fail_counts[ip] = stamps
+
+
+def _reset_failures(ip):
+    with _fail_lock:
+        _fail_counts.pop(ip, None)
+
 
 def init_admin_api(manager, audit_path=None):
     """Wire the admin blueprint to the live ConfigManager."""
@@ -45,19 +95,30 @@ def _admin_token():
 
 
 def require_admin(f):
-    """Bearer-token gate. Fail closed: no ADMIN_TOKEN configured -> 404."""
+    """Bearer-token gate. Fail closed: no ADMIN_TOKEN configured -> 404.
+    Failed attempts are throttled per-IP to blunt brute-force."""
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
+        ip = _client_ip()
+        throttled, retry = _throttled(ip)
+        if throttled:
+            resp = jsonify({"error": "too many failed attempts"})
+            resp.status_code = 429
+            resp.headers['Retry-After'] = str(retry)
+            return resp
         token = _admin_token()
         if not token:
             # Admin API disabled entirely when no token is configured
             return jsonify({"error": "admin API disabled"}), 404
         auth = request.headers.get('Authorization', '')
         if not auth.startswith('Bearer '):
+            _record_failure(ip)
             return jsonify({"error": "missing bearer token"}), 401
         supplied = auth[len('Bearer '):].strip()
         if not hmac.compare_digest(supplied, token):
+            _record_failure(ip)
             return jsonify({"error": "invalid token"}), 401
+        _reset_failures(ip)
         return f(*args, **kwargs)
     return wrapper
 

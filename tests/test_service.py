@@ -464,6 +464,78 @@ domains:
 
 
 # ---------------------------------------------------------------------- #
+# Downstream hardening: UI gating + per-IP auth throttle
+# ---------------------------------------------------------------------- #
+class TestAdminHardening:
+    TOKEN = 'adm' + 'min-tok'
+    HDR = {'Authorization': 'Bearer ' + TOKEN}
+    BAD = {'Authorization': 'Bearer ' + TOKEN + 'x'}
+
+    def _mgr(self, manager, monkeypatch, tmp_path):
+        from src import admin_api
+        mgr = manager("ip:\n  mode: disabled\n")
+        admin_api.init_admin_api(mgr, audit_path=str(tmp_path / 'audit.log'))
+        admin_api._fail_counts.clear()
+        monkeypatch.setenv('ADMIN_TOKEN', self.TOKEN)
+        return mgr
+
+    def test_ui_404_without_token(self, manager, monkeypatch):
+        monkeypatch.delenv('ADMIN_TOKEN', raising=False)
+        c = _app().test_client()
+        assert c.get('/admin/ui').status_code == 404
+
+    def test_ui_served_with_token(self, manager, monkeypatch, tmp_path):
+        self._mgr(manager, monkeypatch, tmp_path)
+        c = _app().test_client()
+        r = c.get('/admin/ui')
+        assert r.status_code == 200
+        assert 'text/html' in r.content_type
+
+    def test_throttle_after_failed_attempts(self, manager, monkeypatch, tmp_path):
+        self._mgr(manager, monkeypatch, tmp_path)
+        from src import admin_api
+        monkeypatch.setattr(admin_api, '_FAIL_MAX', 3)
+        c = _app().test_client()
+        codes = [c.get('/admin/asn-blacklist', headers=self.BAD).status_code
+                 for _ in range(5)]
+        # first 3 failures -> 401, then throttled
+        assert codes[:3] == [401, 401, 401]
+        assert codes[3] == 429 and codes[4] == 429
+        # 429 carries Retry-After
+        r = c.get('/admin/asn-blacklist', headers=self.BAD)
+        assert 'Retry-After' in r.headers
+        admin_api._fail_counts.clear()
+
+    def test_throttle_resets_on_success(self, manager, monkeypatch, tmp_path):
+        self._mgr(manager, monkeypatch, tmp_path)
+        from src import admin_api
+        monkeypatch.setattr(admin_api, '_FAIL_MAX', 3)
+        c = _app().test_client()
+        # 2 failures (under budget), then a success resets the bucket
+        c.get('/admin/asn-blacklist', headers=self.BAD)
+        c.get('/admin/asn-blacklist', headers=self.BAD)
+        assert c.get('/admin/asn-blacklist', headers=self.HDR).status_code == 200
+        # now 3 more failures should NOT trip (bucket was reset by the success)
+        codes = [c.get('/admin/asn-blacklist', headers=self.BAD).status_code
+                 for _ in range(3)]
+        assert codes == [401, 401, 401]
+        admin_api._fail_counts.clear()
+
+    def test_missing_token_not_counted_as_failure(self, manager, monkeypatch, tmp_path):
+        """No ADMIN_TOKEN -> 404 (disabled), and must not poison the throttle
+        bucket — that's a config state, not an attack."""
+        mgr = manager("ip:\n  mode: disabled\n")
+        from src import admin_api
+        admin_api.init_admin_api(mgr, audit_path=str(tmp_path / 'audit.log'))
+        admin_api._fail_counts.clear()
+        monkeypatch.delenv('ADMIN_TOKEN', raising=False)
+        c = _app().test_client()
+        for _ in range(5):
+            assert c.get('/admin/asn-blacklist').status_code == 404
+        assert admin_api._fail_counts == {}
+
+
+# ---------------------------------------------------------------------- #
 # Hot-reload (issue #3)
 # ---------------------------------------------------------------------- #
 class TestHotReload:

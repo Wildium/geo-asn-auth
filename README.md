@@ -285,6 +285,8 @@ environment:
   - CONFIG_POLL_INTERVAL=2         # Config file poll interval (s) for hot-reload
   - TRUST_FORWARDED_HOST=false     # If true, prefer X-Forwarded-Host over Host for domain matching (only if your proxy sets it)
   - AUDIT_LOG_PATH=/blocklists/audit.log  # Admin edit audit log location
+  - ADMIN_FAIL_MAX=10              # Failed admin auth attempts per IP before 429
+  - ADMIN_FAIL_WINDOW_S=60         # Sliding window (s) for the above
 ```
 
 ## Filtering Modes
@@ -609,7 +611,17 @@ docker kill --signal=SIGHUP geo-asn-auth   # force an immediate reload
 
 Set an `ADMIN_TOKEN` environment variable to enable the admin API. Without it, all `/admin/*` routes return 404 (fail closed). All admin calls use `Authorization: Bearer <ADMIN_TOKEN>`.
 
+Generate a strong token — the API is a write path to your block rules:
+
+```bash
+openssl rand -hex 32
+```
+
+Failed auth attempts are throttled per-IP (default: 10 failures / 60s window, then `429` with `Retry-After`). Tune with `ADMIN_FAIL_MAX` and `ADMIN_FAIL_WINDOW_S`; this is a backstop, not a substitute for a strong token.
+
 The write path is safe: **validate → auto-backup (`config.yaml.bak-<ts>`) → atomic write → hot-reload → audit log entry**. A failed reload rolls the file back.
+
+> **Note:** admin edits re-serialize `config.yaml` — YAML comments and custom formatting are **not preserved**. If your config is comment-heavy, keep hand-editing it and use the admin API only when you don't mind the file being rewritten.
 
 ```bash
 # Add a VPN ASN to the blacklist exception list, live in <5s:
@@ -631,7 +643,9 @@ This makes the blocker **agent-operable**: an AI assistant managing your homelab
 
 ## Web Admin UI
 
-With `ADMIN_TOKEN` set, visit `/admin/ui` for a single-page dashboard: view modes and rule counts, add/remove IP, ASN (including conditional user-agent entries), country, and user-agent rules, with a diff-free validate-before-save. It is strictly a frontend over the admin API — there is no separate config-write path.
+With `ADMIN_TOKEN` set, visit `/admin/ui` for a single-page dashboard: view modes and rule counts, add/remove IP, ASN (including conditional user-agent entries), country, and user-agent rules, with a diff-free validate-before-save. It is strictly a frontend over the admin API — there is no separate config-write path. Without `ADMIN_TOKEN` the page itself returns 404 (nothing to see, nothing to scan).
+
+The UI rewrites `config.yaml` on save (with backup + rollback on failure), so YAML comments in the file are not preserved — the page shows this warning up front.
 
 ## Config Lint
 
