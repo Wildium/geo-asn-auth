@@ -18,6 +18,10 @@ from .config import Config
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL = float(os.getenv('CONFIG_POLL_INTERVAL', '2.0'))
+# Floor between recovery retries while no config is loaded. Without it, a
+# broken remote list makes every poll (2s) rebuild Config inline on the
+# request path — up to FETCH_BUDGET_S of network per try, forever.
+RETRY_INTERVAL = float(os.getenv('CONFIG_RETRY_INTERVAL', '10.0'))
 
 
 class ConfigManager:
@@ -35,6 +39,7 @@ class ConfigManager:
         self.last_reload_error = None
         self.reload_count = 0
         self.config_loaded = False
+        self._last_attempt = 0.0
         self._load_initial()
 
     # ------------------------------------------------------------------ #
@@ -105,11 +110,14 @@ class ConfigManager:
             self._last_mtime, self._last_size = mtime, size
             return True
         # While not loaded (e.g. startup failed on a transient blocklist
-        # fetch error), keep retrying every poll — the file didn't change but
-        # the failure may have been transient, and staying fail-closed until
-        # an operator touches the file breaks the auto-recovery promise.
-        # Cheap: everything is blocked anyway, so reload traffic is nil.
-        return not self.config_loaded
+        # fetch error), keep retrying — the file didn't change but the
+        # failure may have been transient, and staying fail-closed until an
+        # operator touches the file breaks the auto-recovery promise. Spaced
+        # by RETRY_INTERVAL so a permanently-broken URL doesn't rebuild
+        # Config (and hammer the network) on every 2s poll.
+        if not self.config_loaded:
+            return time.monotonic() - self._last_attempt >= RETRY_INTERVAL
+        return False
 
     def _stat_file(self):
         try:
@@ -118,6 +126,14 @@ class ConfigManager:
         except OSError:
             self._last_mtime = self._last_size = None
 
+    def rebaseline(self):
+        """Re-stat the config file so the poll stops treating its current
+        content as a pending change. Used after a failed admin rollback:
+        disk holds the rejected change, and without this the next poll sees
+        an mtime delta and reloads it with a fresh fetch budget — silently
+        applying what the admin was just told to fix manually."""
+        self._stat_file()
+
     def reload(self):
         """
         Build a new Config; on success swap it in atomically and close the
@@ -125,6 +141,7 @@ class ConfigManager:
         error (never fail-open, never crash).
         """
         with self._lock:
+            self._last_attempt = time.monotonic()
             try:
                 new_config = Config(config_path=self.config_path())
             except Exception as e:
@@ -153,7 +170,10 @@ def _fail_closed_config():
     empty whitelist short-circuits every request). Used when the real config
     can't be loaded at startup — allow-all would be the fail-open we promise
     never to serve. Built from an in-memory dict so the fallback itself can
-    never fail (no temp file, no filesystem dependency)."""
+    never fail (no temp file, no filesystem dependency). allow_lan/
+    allow_unknown are set False here, but ALLOW_LAN/ALLOW_UNKNOWN env vars
+    still override settings — the empty IP whitelist is what actually blocks
+    everything (it short-circuits before the LAN bypass)."""
     return Config(config_data={
         'settings': {'allow_lan': False, 'allow_unknown': False},
         'ip': {'mode': 'whitelist', 'whitelist': []},

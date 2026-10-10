@@ -645,6 +645,35 @@ settings:
         assert mgr.force_reload() is False
         assert 111 in mgr.current().asn_blacklist  # last-good still serving
 
+    def test_rebaseline_stops_poll_reapplying_rejected_change(self, manager, tmp_path, monkeypatch):
+        """After a failed admin write whose rollback ALSO failed, disk holds
+        the rejected change. The poll must not treat it as a pending change
+        and reload it once the transient failure clears — that would apply
+        what the admin was told to fix manually. rebaseline() is the fix."""
+        import requests as req
+        import src.blocklist_fetcher as bf
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [111]\n")
+        assert mgr.current().asn_blacklist == {111}
+        (tmp_path / 'config.yaml').write_text(
+            "asn:\n  mode: blacklist\n  blacklist: [111]\n"
+            "  blacklist_urls: ['http://flaky.invalid/list.txt']\n")
+
+        calls = []
+        def flaky_get(url, timeout=None):
+            calls.append(url)
+            if len(calls) == 1:
+                raise req.exceptions.ConnectionError('transient blip')
+            resp = Mock(); resp.text = '222\n'; resp.raise_for_status = Mock()
+            return resp
+        monkeypatch.setattr(bf.requests, 'get', flaky_get)
+
+        time.sleep(0.01)
+        assert mgr.force_reload() is False   # rejected (transient fetch blip)
+        mgr.rebaseline()                     # what admin_api does on rollback failure
+        cfg = mgr.current()                  # poll must NOT re-apply the rejected change
+        assert 222 not in cfg.asn_blacklist  # rejected content NOT live
+        assert mgr.config_loaded is True     # last-good still serving
+
     def test_transient_startup_failure_retries_each_poll(self, tmp_path, monkeypatch):
         """Startup failed while the file EXISTS (transient fetch error): the
         poll must keep retrying until it succeeds, not dead-end after one

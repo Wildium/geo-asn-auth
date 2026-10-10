@@ -38,6 +38,17 @@ class BlocklistLoadError(Exception):
     pass
 
 
+def _read_cache_entries(cache_file, url, list_type):
+    """Read+parse a cached list file. Any OSError (permissions, exists->open
+    race, bad mount) becomes BlocklistLoadError so the load FAILS rather than
+    the caller swallowing a raw error and silently dropping the blocklist."""
+    try:
+        with open(cache_file, 'r') as f:
+            return {line.strip() for line in f if line.strip() and not line.strip().startswith('#')}
+    except OSError as e:
+        raise BlocklistLoadError(f"cannot read cached {list_type} list for {url}: {e}") from e
+
+
 def fetch_text_list(url, cache_hours=168, list_type='text', deadline=None):
     """
     Fetch a text list from URL (one entry per line) with caching.
@@ -70,9 +81,7 @@ def fetch_text_list(url, cache_hours=168, list_type='text', deadline=None):
         
         if file_age_hours < cache_hours:
             logger.info(f"Using cached {list_type} list from {url} (age: {file_age_hours:.1f}h)")
-            with open(cache_file, 'r') as f:
-                entries = {line.strip() for line in f if line.strip() and not line.strip().startswith('#')}
-                return entries
+            return _read_cache_entries(cache_file, url, list_type)
         else:
             logger.info(f"Cached {list_type} list from {url} expired (age: {file_age_hours:.1f}h), fetching fresh")
     
@@ -112,9 +121,7 @@ def fetch_text_list(url, cache_hours=168, list_type='text', deadline=None):
         # Try to use stale cache if available
         if os.path.exists(cache_file):
             logger.warning(f"Using stale cached {list_type} list from {url}")
-            with open(cache_file, 'r') as f:
-                entries = {line.strip() for line in f if line.strip() and not line.strip().startswith('#')}
-                return entries
+            return _read_cache_entries(cache_file, url, list_type)
         
         # No cache to fall back to: an empty list here would swap in a config
         # with this blocklist silently dropped (fail-open). Fail the load so

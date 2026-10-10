@@ -75,17 +75,11 @@ def _record_failure(ip):
     now = time.monotonic()
     cutoff = now - _FAIL_WINDOW_S
     with _fail_lock:
-        # Bound the dict: XFF is spoofable, so an attacker can spray unique
-        # "IPs" and grow this without limit. Prune expired entries; if still
-        # full, drop the oldest-seen bucket so memory stays bounded.
-        expired = [k for k, v in _fail_counts.items()
-                   if not v or v[-1] < cutoff]
-        for k in expired:
-            del _fail_counts[k]
-        # <=0 disables the cap only if the operator explicitly opts out;
-        # treat it as "don't track" rather than silently unbounded growth.
+        # <=0 means "don't track" (operator opted out); anything else keeps
+        # the dict bounded so an XFF spray can't grow it without limit.
         if _FAIL_MAX_IPS <= 0:
             return
+        # Prune expired entries; if still full, drop the oldest-seen bucket.
         expired = [k for k, v in _fail_counts.items()
                    if not v or v[-1] < cutoff]
         for k in expired:
@@ -220,7 +214,12 @@ def _write_config(raw):
                 # Rollback failed: the rejected change is what's on disk. Do
                 # NOT force_reload() — that could succeed with a fresh fetch
                 # budget and silently apply the rejected change while we
-                # report failure. Last-good keeps serving; tell the truth.
+                # report failure. Re-baseline the poll too, otherwise the
+                # next mtime check sees the rejected content as a pending
+                # change and reloads it ~2s later anyway. Last-good keeps
+                # serving until an operator edits the file (which re-triggers
+                # the poll legitimately).
+                _manager.rebaseline()
                 return False, (f"reload failed AND rollback failed — {path} still "
                                f"contains the rejected change; fix it manually")
             return False, "reload failed — no previous config to roll back to"
