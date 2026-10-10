@@ -104,7 +104,10 @@ async function loadAll(){
     document.getElementById('reloadinfo').textContent =
       'reloads: '+(cfg.reload.reload_count||0)+' · last: '+(cfg.reload.last_reload||'—');
     const warns = document.getElementById('warns');
-    warns.innerHTML = (cfg.lint_warnings||[]).map(w=>'<div class="warn">⚠ '+w+'</div>').join('');
+    warns.replaceChildren(...(cfg.lint_warnings||[]).map(w=>{
+      const d = document.createElement('div'); d.className='warn';
+      d.textContent = '\u26a0 ' + w; return d;
+    }));
     const modes = {}; // modes come from /health/detail
     let detail = {};
     try{ detail = await (await fetch('/health/detail',{headers:{'Authorization':'Bearer '+token}})).json(); }catch(e){}
@@ -114,11 +117,15 @@ async function loadAll(){
       const data = await api(s.key);
       const card = document.createElement('div'); card.className='card';
       const mode = (detail.config||{})[s.modeKey] || '';
-      card.innerHTML = '<h2>'+s.title+'</h2><div class="mode">mode: '+(mode||'?')+' · '+data.entries.length+' entries</div>';
+      const h2 = document.createElement('h2'); h2.textContent = s.title;
+      const modeDiv = document.createElement('div'); modeDiv.className='mode';
+      modeDiv.textContent = 'mode: '+(mode||'?')+' \u00b7 '+data.entries.length+' entries';
+      card.appendChild(h2); card.appendChild(modeDiv);
       const ul = document.createElement('ul');
       for(const e of data.entries){
         const li = document.createElement('li');
-        li.innerHTML = '<span>'+entryLabel(e)+'</span>';
+        const span = document.createElement('span'); span.textContent = entryLabel(e);
+        li.appendChild(span);
         const del = document.createElement('button'); del.textContent='remove';
         del.onclick = ()=>edit(s.key, [], [entryValue(e)]);
         li.appendChild(del); ul.appendChild(li);

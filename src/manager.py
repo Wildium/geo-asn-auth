@@ -145,11 +145,6 @@ def _empty_config():
         f.write('')
         path = f.name
     try:
-        old = os.environ.get('CONFIG_PATH')
-        os.environ['CONFIG_PATH'] = path
-        cfg = Config()
-        if old is not None:
-            os.environ['CONFIG_PATH'] = old
-        return cfg
+        return Config(config_path=path)
     finally:
         os.unlink(path)

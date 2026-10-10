@@ -292,6 +292,90 @@ domains:
         assert 212238 in dc.asn_whitelist
         assert 16509 in dc.asn_blacklist  # inherited
 
+    def test_domain_configs_precomputed(self, make_config):
+        """Regression: domain configs must be built once at load, not rebuilt
+        per request (the old path recompiled UA regexes on every hit)."""
+        cfg = make_config("""
+domains:
+  admin.example.com:
+    user_agent:
+      mode: blacklist
+      blacklist: ['sqlmap', 'nikto']
+""")
+        a = cfg.get_config_for_domain('admin.example.com')
+        b = cfg.get_config_for_domain('admin.example.com')
+        assert a is b, "domain config object should be cached, not rebuilt"
+        assert a.user_agent_blacklist_regex is b.user_agent_blacklist_regex
+
+    def test_domain_config_inherits_geo_provider(self, make_config):
+        """Domain objects are shallow copies — they must share the loaded
+        geo provider, not a None snapshot taken before the provider loads."""
+        cfg = make_config("""
+domains:
+  admin.example.com:
+    ip:
+      mode: whitelist
+      whitelist: ['1.2.3.4']
+""")
+        dc = cfg.get_config_for_domain('admin.example.com')
+        assert dc.geo_provider is cfg.geo_provider
+
+
+# ---------------------------------------------------------------------- #
+# Host header trust (X-Forwarded-Host spoofing)
+# ---------------------------------------------------------------------- #
+class TestHostHeaderTrust:
+    def _app(self, make_config):
+        from src.app import app
+        return app
+
+    def test_host_used_by_default(self, make_config, monkeypatch):
+        monkeypatch.delenv('TRUST_FORWARDED_HOST', raising=False)
+        cfg = make_config("""
+ip:
+  mode: disabled
+domains:
+  strict.example.com:
+    ip:
+      mode: whitelist
+      whitelist: ['5.6.7.8']
+""")
+        from src.verification import verify_request
+        from flask import Flask
+        app = Flask(__name__)
+        with app.test_request_context(
+            '/verify',
+            headers={'Host': 'strict.example.com',
+                     'X-Forwarded-Host': 'loose.example.com',
+                     'X-Forwarded-For': '9.9.9.9'},
+        ):
+            # Host=strict -> strict domain config -> 9.9.9.9 not whitelisted -> blocked
+            body, code = verify_request(cfg)
+            assert code == 403
+
+    def test_forwarded_host_ignored_unless_opted_in(self, make_config, monkeypatch):
+        monkeypatch.delenv('TRUST_FORWARDED_HOST', raising=False)
+        cfg = make_config("""
+ip:
+  mode: disabled
+domains:
+  loose.example.com:
+    ip:
+      mode: disabled
+""")
+        from src.verification import verify_request
+        from flask import Flask
+        app = Flask(__name__)
+        with app.test_request_context(
+            '/verify',
+            headers={'Host': 'strict.example.com',
+                     'X-Forwarded-Host': 'loose.example.com',
+                     'X-Forwarded-For': '9.9.9.9'},
+        ):
+            # Host=strict has no domain override -> global (ip disabled) -> allow
+            body, code = verify_request(cfg)
+            assert code == 200
+
 
 # ---------------------------------------------------------------------- #
 # Hot-reload (issue #3)
@@ -490,3 +574,28 @@ class TestIPinfoLite:
         assert p.name == 'ipinfo-lite'
         p2 = create_provider({}, None, None, None)
         assert p2.name == 'maxmind'
+
+    def test_real_mmdb_end_to_end(self, tmp_path):
+        """Integration against a REAL .mmdb file — the Mock above can invent
+        an API the client doesn't have (geoip2.Reader has no public .get();
+        maxminddb.Reader does). This test pins the actual client surface."""
+        import netaddr
+        from mmdb_writer import MMDBWriter
+        from src.geo_providers import create_provider
+
+        db_path = tmp_path / 'ipinfo_lite.mmdb'
+        w = MMDBWriter(ip_version=4, database_type='IPinfo-Lite')
+        w.insert_network(netaddr.IPSet(['1.2.3.0/24']), {
+            'country': 'Canada', 'country_code': 'CA',
+            'asn': 174, 'as_name': 'Cogent', 'as_domain': 'cogentco.com',
+        })
+        w.to_db_file(str(db_path))
+
+        p = create_provider({'provider': 'ipinfo-lite',
+                             'ipinfo_lite_db': str(db_path)}, None, None, None)
+        assert p.country_available and p.asn_available
+        assert p.country_lookup('1.2.3.4') == {'iso_code': 'CA', 'name': 'Canada'}
+        assert p.asn_lookup('1.2.3.4') == {'number': 174, 'org': 'Cogent'}
+        with pytest.raises(AddressNotFoundError):
+            p.country_lookup('9.9.9.9')
+        p.close()

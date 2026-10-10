@@ -3,6 +3,7 @@ Geoblock Service - Flask application for IP/country/ASN-based access control.
 Provides ForwardAuth endpoint for Traefik reverse proxy.
 """
 
+import hmac
 import logging
 import os
 import signal
@@ -81,7 +82,8 @@ def health_detail():
     if not token:
         return jsonify({"error": "detail endpoint disabled (no ADMIN_TOKEN)"}), 404
     auth = request.headers.get('Authorization', '')
-    if not auth.startswith('Bearer ') or auth[len('Bearer '):].strip() != token:
+    supplied = auth[len('Bearer '):].strip() if auth.startswith('Bearer ') else ''
+    if not hmac.compare_digest(supplied, token):
         return jsonify({"error": "unauthorized"}), 401
 
     config = manager.current()

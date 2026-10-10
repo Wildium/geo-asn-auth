@@ -3,6 +3,7 @@ Core verification logic for IP, country, and ASN-based blocking.
 """
 
 import logging
+import os
 import fnmatch
 from flask import jsonify, request
 from geoip2.errors import AddressNotFoundError
@@ -24,25 +25,23 @@ def verify_request(config):
         - (error_response, 403) for blocked requests
     """
     try:
-        # Log all headers for debugging
-        logger.info(f"Request headers: Host={request.headers.get('Host')}, "
-                   f"X-Forwarded-Host={request.headers.get('X-Forwarded-Host')}, "
-                   f"X-Forwarded-For={request.headers.get('X-Forwarded-For')}, "
-                   f"X-Real-IP={request.headers.get('X-Real-IP')}")
-        
-        # Get domain-specific configuration if available
-        # Prefer X-Forwarded-Host (from reverse proxy) over Host header
-        host = request.headers.get('X-Forwarded-Host') or request.headers.get('Host', '')
-        
-        # Log the host header for debugging
-        logger.info(f"Using Host value: '{host}'")
-        
+        # Get domain-specific configuration if available.
+        # Host-first: the proxy pins Host per-vhost, so it can't be forged by
+        # the client. X-Forwarded-Host is attacker-controlled unless the
+        # fronting proxy is known to set it — opt in with TRUST_FORWARDED_HOST.
+        host = request.headers.get('Host', '')
+        if os.getenv('TRUST_FORWARDED_HOST', '').lower() == 'true':
+            host = request.headers.get('X-Forwarded-Host') or host
+
+        logger.debug(f"Request headers: Host={request.headers.get('Host')}, "
+                     f"X-Forwarded-Host={request.headers.get('X-Forwarded-Host')}, "
+                     f"X-Forwarded-For={request.headers.get('X-Forwarded-For')}, "
+                     f"X-Real-IP={request.headers.get('X-Real-IP')}")
+
         domain_config = config.get_config_for_domain(host)
-        
+
         if domain_config is not config:
-            logger.info(f"✓ Using domain-specific config for: {host}")
-        else:
-            logger.info(f"Using global config (no domain match for: {host})")
+            logger.debug(f"Using domain-specific config for: {host}")
         
         client_ip = get_client_ip()
         
@@ -135,11 +134,10 @@ def _check_ip(client_ip, config):
         Response tuple if request should be blocked/allowed, None to continue checks
     """
     if config.ip_mode == 'disabled':
-        logger.info(f"IP check skipped (mode=disabled)")
+        logger.debug(f"IP check skipped (mode=disabled)")
         return None
     
-    logger.info(f"IP check: mode={config.ip_mode}, client_ip={client_ip}, "
-                f"whitelist={config.ip_whitelist}, blacklist={config.ip_blacklist}")
+    logger.debug(f"IP check: mode={config.ip_mode}, client_ip={client_ip}")
     
     # In blacklist mode: whitelist = bypass all checks, blacklist = immediate block
     if config.ip_mode == 'blacklist':

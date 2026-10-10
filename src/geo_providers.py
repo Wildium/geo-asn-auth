@@ -16,6 +16,7 @@ so allow_unknown handling stays uniform.
 import logging
 import os
 
+import maxminddb
 import geoip2.database
 from geoip2.errors import AddressNotFoundError
 
@@ -71,6 +72,10 @@ class MaxMindProvider:
 class IPinfoLiteProvider:
     """
     IPinfo Lite combined database (country + ASN in one MMDB).
+
+    Opened with maxminddb directly (not geoip2): the IPinfo Lite DB has no
+    MaxMind record classes, and geoip2's Reader exposes no public .get() —
+    lookups must go through maxminddb.Reader.get(), which returns the raw dict.
 
     Schema per record: network, country, country_code, continent,
     continent_code, asn (int), as_name, as_domain.
@@ -144,7 +149,7 @@ def create_provider(geoip_config, country_db_path, asn_db_path, ipinfo_db_path):
 
     if provider in ('ipinfo-lite', 'ipinfo_lite', 'ipinfo'):
         path = geoip_config.get('ipinfo_lite_db') or ipinfo_db_path
-        reader = _open_mmdb(path, 'IPinfo Lite')
+        reader = _open_maxminddb(path, 'IPinfo Lite')
         return IPinfoLiteProvider(reader)
 
     logger.error(f"Unknown geoip provider '{provider}', falling back to maxmind")
@@ -157,6 +162,19 @@ def _open_mmdb(path, label):
     try:
         if path and os.path.exists(path):
             reader = geoip2.database.Reader(path)
+            logger.info(f"Loaded {label} database from {path}")
+            return reader
+        logger.warning(f"{label} database not found at {path}")
+    except Exception as e:
+        logger.error(f"Failed to load {label} database ({path}): {e}")
+    return None
+
+
+def _open_maxminddb(path, label):
+    """Open an MMDB with the raw maxminddb client (dict records via .get())."""
+    try:
+        if path and os.path.exists(path):
+            reader = maxminddb.open_database(path)
             logger.info(f"Loaded {label} database from {path}")
             return reader
         logger.warning(f"{label} database not found at {path}")

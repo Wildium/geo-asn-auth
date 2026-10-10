@@ -1,5 +1,6 @@
 flask==3.0.0
 geoip2==4.7.0
+maxminddb==2.8.2
 pyyaml==6.0.1
 gunicorn==21.2.0
 requests==2.31.0

@@ -202,7 +202,7 @@ blacklist_urls:
 
 You can override global settings for specific domains by adding a `domains:` section to your `config.yaml`. This is useful when different sites/APIs need different protection rules.
 
-**Matching**: Domains are matched against the `Host` header. Supports exact matches and wildcards (`*.example.com`).
+**Matching**: Domains are matched against the `Host` header. Supports exact matches and wildcards (`*.example.com`). The `Host` header is used because the fronting proxy pins it per-vhost, so a client can't forge it to reach a more-permissive domain config. If your proxy sets `X-Forwarded-Host` and you trust it, set `TRUST_FORWARDED_HOST=true` to prefer that header instead.
 
 **Three Override Strategies:**
 
@@ -283,6 +283,7 @@ environment:
   - ADMIN_TOKEN=***           # Enables the admin API + web UI (unset = disabled)
   - DNS_TTL=60                     # TTL (s) for hostname/DDNS entries in IP lists
   - CONFIG_POLL_INTERVAL=2         # Config file poll interval (s) for hot-reload
+  - TRUST_FORWARDED_HOST=false     # If true, prefer X-Forwarded-Host over Host for domain matching (only if your proxy sets it)
   - AUDIT_LOG_PATH=/blocklists/audit.log  # Admin edit audit log location
 ```
 
@@ -601,6 +602,8 @@ Config is watched continuously (mtime poll, ~2s) and reloaded on `SIGHUP`. Editi
 ```bash
 docker kill --signal=SIGHUP geo-asn-auth   # force an immediate reload
 ```
+
+> Note: under the shipped gunicorn config (multiple workers), `docker kill --signal=SIGHUP` signals the gunicorn master, which does not forward SIGHUP to workers — the per-worker mtime poll is what actually reloads them (within `CONFIG_POLL_INTERVAL`). The poll path is the reliable one; SIGHUP is a convenience for single-process/dev runs.
 
 ## Admin API (runtime rule edits)
 

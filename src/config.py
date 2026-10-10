@@ -194,6 +194,18 @@ class Config:
         # Back-compat attributes (tests / health)
         self.country_reader = getattr(self.geo_provider, 'country_reader', None)
         self.asn_reader = getattr(self.geo_provider, 'asn_reader', None)
+
+        # Precompute merged Config objects per domain pattern (per-request
+        # rebuild recompiled regexes on every hit). Domain configs are static —
+        # build once at load, dict-lookup per request. Must run AFTER the geo
+        # provider loads: domain objects are shallow copies of this instance's
+        # attributes at copy time.
+        self._domain_config_cache = {}
+        for pattern, parsed in self.domain_configs.items():
+            try:
+                self._domain_config_cache[pattern] = self._create_domain_config(parsed)
+            except Exception as e:
+                logger.error(f"Failed to precompute domain config for {pattern}: {e}")
         
         # Log configuration
         self._log_config()
@@ -242,13 +254,15 @@ class Config:
         
         # Exact match first
         if host in self.domain_configs:
-            return self._create_domain_config(self.domain_configs[host])
+            cached = self._domain_config_cache.get(host)
+            return cached if cached is not None else self
         
         # Check for wildcard matches (*.example.com)
         for domain_pattern, domain_config in self.domain_configs.items():
             if '*' in domain_pattern and fnmatch.fnmatch(host, domain_pattern):
                 logger.debug(f"Domain '{host}' matched pattern '{domain_pattern}'")
-                return self._create_domain_config(domain_config)
+                cached = self._domain_config_cache.get(domain_pattern)
+                return cached if cached is not None else self
         
         # No match, return global config
         return self
