@@ -106,11 +106,14 @@ class IPMatcher:
 class Config:
     """Configuration container for geoblock service."""
     
-    def __init__(self, config_path=None):
+    def __init__(self, config_path=None, config_data=None):
         """Initialize and load configuration.
 
         config_path: explicit YAML path (used by ConfigManager for hot-reload).
         Falls back to the CONFIG_PATH env / module default when omitted.
+        config_data: pre-built config dict; skips file loading entirely. Used
+        for the fail-closed startup fallback so it can't depend on a writable
+        temp dir.
         """
         self._config_path = config_path
         # One aggregate fetch budget per config load (shared by ASN and UA
@@ -118,7 +121,7 @@ class Config:
         from .blocklist_fetcher import FETCH_BUDGET_S
         self._fetch_deadline = time.monotonic() + FETCH_BUDGET_S
         # Load YAML config
-        self.raw_config = self._load_yaml_config()
+        self.raw_config = config_data if config_data is not None else self._load_yaml_config()
         
         # Parse settings FIRST (needed by other parsers for cache_hours)
         settings = self.raw_config.get('settings', {})
@@ -480,6 +483,11 @@ class Config:
                 all_entries.update(entries)
                 logger.info(f"Loaded {len(entries)} user-agents from {url}")
             except Exception as e:
+                from .blocklist_fetcher import FetchBudgetExceeded
+                if isinstance(e, FetchBudgetExceeded):
+                    # Don't swallow: swapping in a config with a UA blocklist
+                    # silently dropped is fail-open. Fail the load instead.
+                    raise
                 logger.error(f"Failed to fetch user-agent list from {url}: {e}")
         
         return all_entries

@@ -97,7 +97,10 @@ class ConfigManager:
             return False
         if self._last_mtime is None:
             self._last_mtime, self._last_size = mtime, size
-            return False
+            # If startup failed (no last-good config), the file appearing IS
+            # the recovery event — reload now rather than just recording a
+            # baseline and staying fail-closed forever.
+            return not self.config_loaded
         if (mtime, size) != (self._last_mtime, self._last_size):
             self._last_mtime, self._last_size = mtime, size
             return True
@@ -144,12 +147,6 @@ def _fail_closed_config():
     """A valid Config whose rules block everything (IP whitelist mode with an
     empty whitelist short-circuits every request). Used when the real config
     can't be loaded at startup — allow-all would be the fail-open we promise
-    never to serve."""
-    import tempfile
-    with tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False) as f:
-        f.write('ip:\n  mode: whitelist\n  whitelist: []\n')
-        path = f.name
-    try:
-        return Config(config_path=path)
-    finally:
-        os.unlink(path)
+    never to serve. Built from an in-memory dict so the fallback itself can
+    never fail (no temp file, no filesystem dependency)."""
+    return Config(config_data={'ip': {'mode': 'whitelist', 'whitelist': []}})

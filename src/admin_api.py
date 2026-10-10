@@ -82,7 +82,7 @@ def _record_failure(ip):
                    if not v or v[-1] < cutoff]
         for k in expired:
             del _fail_counts[k]
-        if len(_fail_counts) >= _FAIL_MAX_IPS:
+        if _FAIL_MAX_IPS > 0 and len(_fail_counts) >= _FAIL_MAX_IPS:
             oldest = min(_fail_counts, key=lambda k: _fail_counts[k][0])
             del _fail_counts[oldest]
         stamps = [t for t in _fail_counts.get(ip, ()) if t >= cutoff]
@@ -193,9 +193,17 @@ def _write_config(raw):
                 # Atomic restore — a concurrent poll-reload must never read a
                 # half-written config off the rollback path.
                 rb_path = path + '.rollback'
-                with open(rb_path, 'w') as f:
-                    f.write(old_text)
-                os.replace(rb_path, path)
+                try:
+                    with open(rb_path, 'w') as f:
+                        f.write(old_text)
+                    os.replace(rb_path, path)
+                except Exception as e:
+                    logger.critical(f"Config rollback FAILED ({e}) — fix {path} manually")
+                    if os.path.exists(rb_path):
+                        try:
+                            os.unlink(rb_path)
+                        except OSError:
+                            pass
                 _manager.force_reload()
             return False, "reload failed — change rolled back"
         return True, None

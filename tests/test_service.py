@@ -599,16 +599,53 @@ settings:
         assert mgr.config_loaded is False
         assert self._status(mgr.current(), '9.9.9.9') in (403, 404)  # blocked, NOT 200
 
+    def test_startup_failure_recovers_when_file_appears(self, tmp_path, monkeypatch):
+        """The fail-closed fallback must not be a dead end: when the typo'd
+        config file later appears, the poll must reload and serve real rules
+        (no restart). Regression for the _file_changed baseline bug."""
+        from src.manager import ConfigManager
+        monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
+        path = tmp_path / 'config.yaml'
+        mgr = ConfigManager(config_path=str(path), poll_interval=0)
+        assert mgr.config_loaded is False
+        assert self._status(mgr.current(), '1.2.3.4') in (403, 404)
+        # operator fixes the mount: file now exists with real rules
+        path.write_text("ip:\n  mode: blacklist\n  blacklist: ['9.9.9.9']\n")
+        cfg = mgr.current()  # poll sees the file appear -> reload
+        assert mgr.config_loaded is True
+        assert self._status(cfg, '9.9.9.9') in (403, 404)   # still blocks the bad IP
+        assert self._status(cfg, '8.8.8.8') == 200          # allows everyone else
+
     def test_fetch_budget_skips_network_past_deadline(self, tmp_path, monkeypatch):
-        """N stale URLs must not stack N x FETCH_TIMEOUT on the request path."""
+        """N stale URLs must not stack N x FETCH_TIMEOUT on the request path.
+        Past the deadline with no cache: raise (fail the load) rather than
+        return an empty list — silently dropping a blocklist is fail-open."""
         import src.blocklist_fetcher as bf
         monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
         monkeypatch.setattr(bf, 'CACHE_DIR', str(tmp_path / 'cache'))
         with patch.object(bf.requests, 'get') as mock_get:
-            out = bf.fetch_text_list('http://example.com/ua.txt', list_type='user-agent',
-                                     deadline=time.monotonic() - 1)
+            with pytest.raises(bf.FetchBudgetExceeded):
+                bf.fetch_text_list('http://example.com/ua.txt', list_type='user-agent',
+                                   deadline=time.monotonic() - 1)
         mock_get.assert_not_called()
-        assert out == set()
+
+    def test_budget_exhaustion_fails_reload_not_silent_drop(self, manager, tmp_path, monkeypatch):
+        """A reload whose remote ASN list can't be fetched within budget must
+        FAIL (keep last-good serving), not swap in a config with the blacklist
+        silently dropped."""
+        import src.blocklist_fetcher as bf
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [111]\n")
+        good = mgr.current()
+        assert 111 in good.asn_blacklist
+        cfg_path = tmp_path / 'config.yaml'
+        cfg_path.write_text(
+            "asn:\n  mode: blacklist\n  blacklist: [111]\n"
+            "  blacklist_urls: ['http://unreachable.invalid/list.txt']\n")
+        monkeypatch.setattr(bf, 'FETCH_TIMEOUT', 0.01)
+        monkeypatch.setattr(bf, 'FETCH_BUDGET_S', 0.0)  # deadline already passed
+        time.sleep(0.01)
+        assert mgr.force_reload() is False  # load failed...
+        assert 111 in mgr.current().asn_blacklist  # ...last-good still serving
 
     def test_throttle_dict_bounded(self, monkeypatch):
         """XFF-spraying must not grow the failure tracker without limit."""
