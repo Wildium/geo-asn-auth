@@ -7,7 +7,7 @@ import uuid
 import re
 import html
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import request, jsonify, Response
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ def render_block_page(reason, client_ip, country=None, asn=None,
         Flask Response object with the configured block status code
     """
     request_id = str(uuid.uuid4())[:8]
-    timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     # Log the same id the client sees, so a support request quoting the
     # block page can be matched in the logs.
     logger.info(f"Blocked {client_ip}: {reason} (request_id={request_id})")

@@ -531,6 +531,107 @@ domains:
 
 
 # ---------------------------------------------------------------------- #
+# Review round 2: XFF fail-open, fail-closed startup, fetch budget,
+# throttle bound, ASN-whitelist UA conditions
+# ---------------------------------------------------------------------- #
+class TestReviewRound2:
+    def _status(self, cfg, ip, ua='Mozilla/5.0'):
+        app = _app()
+        with app.test_request_context(
+            headers={'X-Forwarded-For': ip, 'User-Agent': ua, 'Host': ''}
+        ):
+            resp = verify_request(cfg)
+        return resp[1] if isinstance(resp, tuple) else resp.status_code
+
+    @staticmethod
+    def _cn_reader():
+        """Mock reader that behaves like maxminddb: ValueError on an
+        unparseable IP, CN otherwise."""
+        import ipaddress
+
+        def country(ip):
+            ipaddress.ip_address(ip)  # raises ValueError like the real reader
+            return Mock(country=Mock(iso_code='CN', name='China'))
+        prov = MaxMindProvider(Mock(), None)
+        prov.country_reader.country.side_effect = country
+        return prov
+
+    def test_garbage_xff_cannot_bypass_country_block(self, make_config):
+        """X-Forwarded-For is attacker-controlled. A non-IP value used to
+        raise ValueError inside the geo lookup, hit the catch-all, and return
+        200 — a one-header bypass of every geo/ASN rule."""
+        cfg = make_config("countries:\n  mode: blacklist\n  blacklist: ['CN']\nsettings:\n  allow_lan: false\n  allow_unknown: false\n")
+        cfg.geo_provider = self._cn_reader()
+        # valid blocked IP -> blocked
+        assert self._status(cfg, '9.9.9.9') == 403
+        # garbage XFF must NOT bypass; allow_unknown=false -> blocked
+        assert self._status(cfg, 'garbage-not-an-ip') == 403
+
+    def test_garbage_xff_honors_allow_unknown(self, make_config):
+        cfg = make_config("countries:\n  mode: blacklist\n  blacklist: ['CN']\nsettings:\n  allow_lan: false\n  allow_unknown: true\n")
+        cfg.geo_provider = self._cn_reader()
+        assert self._status(cfg, 'garbage-not-an-ip') == 200
+
+    def test_asn_whitelist_ua_condition_enforced(self, make_config):
+        """asn.mode=whitelist entries with user_agents must only match when
+        the UA matches too — same semantics as blacklist mode."""
+        cfg = make_config("""
+asn:
+  mode: whitelist
+  whitelist:
+    - asn: 15169
+      user_agents: ['Sonarr/*']
+settings:
+  allow_lan: false
+""")
+        prov = MaxMindProvider(None, Mock())
+        prov.asn_reader.asn.return_value = Mock(autonomous_system_number=15169, autonomous_system_organization='Google')
+        cfg.geo_provider = prov
+        assert self._status(cfg, '9.9.9.9', ua='Sonarr/3.0') == 200
+        assert self._status(cfg, '9.9.9.9', ua='curl') == 403
+
+    def test_startup_config_failure_is_fail_closed(self, tmp_path, monkeypatch):
+        """A typo'd CONFIG_PATH must not serve allow-all. The fallback config
+        blocks every request until the file is fixed (hot-reload recovers)."""
+        from src.manager import ConfigManager
+        monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
+        mgr = ConfigManager(config_path=str(tmp_path / 'typo-config.yaml'), poll_interval=0)
+        assert mgr.config_loaded is False
+        assert self._status(mgr.current(), '9.9.9.9') in (403, 404)  # blocked, NOT 200
+
+    def test_fetch_budget_skips_network_past_deadline(self, tmp_path, monkeypatch):
+        """N stale URLs must not stack N x FETCH_TIMEOUT on the request path."""
+        import src.blocklist_fetcher as bf
+        monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
+        monkeypatch.setattr(bf, 'CACHE_DIR', str(tmp_path / 'cache'))
+        with patch.object(bf.requests, 'get') as mock_get:
+            out = bf.fetch_text_list('http://example.com/ua.txt', list_type='user-agent',
+                                     deadline=time.monotonic() - 1)
+        mock_get.assert_not_called()
+        assert out == set()
+
+    def test_throttle_dict_bounded(self, monkeypatch):
+        """XFF-spraying must not grow the failure tracker without limit."""
+        import src.admin_api as aa
+        monkeypatch.setattr(aa, '_FAIL_MAX_IPS', 50)
+        aa._fail_counts.clear()
+        for i in range(500):
+            aa._record_failure(f'10.0.{i // 256}.{i % 256}')
+        assert len(aa._fail_counts) <= 50
+        aa._fail_counts.clear()
+
+    def test_health_no_reload_error_leak(self, manager, monkeypatch):
+        """last_reload_error can quote config file paths — it belongs behind
+        ADMIN_TOKEN at /health/detail, not on the unauthenticated /health."""
+        mgr = manager("ip:\n  mode: bogus\n")
+        import src.app as appmod
+        monkeypatch.setattr(appmod, 'manager', mgr)
+        d = _app().test_client().get('/health').get_json()
+        assert 'last_reload_error' not in d
+        assert d['status'] == 'degraded'
+
+
+# ---------------------------------------------------------------------- #
 # Block page: custom path + XSS escaping
 # ---------------------------------------------------------------------- #
 class TestBlockPage:

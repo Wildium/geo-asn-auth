@@ -285,9 +285,12 @@ environment:
   - ADMIN_TOKEN=***           # Enables the admin API + web UI (unset = disabled)
   - DNS_TTL=60                     # TTL (s) for hostname/DDNS entries in IP lists
   - CONFIG_POLL_INTERVAL=2         # Config file poll interval (s) for hot-reload
+  - BLOCKLIST_FETCH_TIMEOUT=10     # Per-URL blocklist fetch timeout (s)
+  - BLOCKLIST_FETCH_BUDGET_S=15    # Total blocklist fetch budget per config load (s)
   - TRUST_FORWARDED_HOST=false     # If true, prefer X-Forwarded-Host over Host for domain matching (only if your proxy sets it)
   - AUDIT_LOG_PATH=/blocklists/audit.log  # Admin edit audit log location
   - ADMIN_FAIL_MAX=10              # Failed admin auth attempts per IP before 429
+  - ADMIN_FAIL_MAX_IPS=1000        # Max tracked IPs in the auth-failure throttle
   - ADMIN_FAIL_WINDOW_S=60         # Sliding window (s) for the above
 ```
 
@@ -646,7 +649,8 @@ caddy reload  # Or: docker exec caddy caddy reload
 Config is watched continuously (mtime poll, ~2s) and reloaded on `SIGHUP`. Editing `config.yaml` makes new rules live within seconds **without restarting the container** — no dropped ForwardAuth requests.
 
 - On a reload failure (malformed YAML, invalid mode), the service **keeps serving the last-good config** and logs the error. It never fails-open or crashes on a typo.
-- `/health` reports `last_reload` and `last_reload_error` so you can see reload status.
+- If the config can't be loaded **at startup** (typo'd `CONFIG_PATH`, malformed YAML), the service starts **fail-closed**: every request is blocked, `/health` reports `degraded`, and it recovers automatically once the file is fixed (hot-reload, no restart). An allow-all fallback would turn a typo into an open door.
+- `/health` reports `config_loaded` and `last_reload`; the reload error text (which can quote file paths) is behind `ADMIN_TOKEN` at `/health/detail`.
 - Remote blocklists are only re-fetched when their cache expires (reload doesn't hammer blocklist URLs).
 
 ```bash

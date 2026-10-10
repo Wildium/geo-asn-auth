@@ -77,9 +77,14 @@ class ConfigManager:
             self.last_reload = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
             self._stat_file()
         except Exception as e:
-            # Startup failure: start permissive (empty config) but never crash.
-            logger.critical(f"Initial config load failed: {e} — starting with empty config")
-            self._config = _empty_config()
+            # Startup failure: there is no last-good config to fall back to,
+            # and an empty (all-disabled) config would be allow-all — exactly
+            # the fail-open a config typo must not cause. Serve a fail-closed
+            # config instead: service stays up, /health reports degraded, and
+            # every request is blocked until the config is fixed (hot-reload
+            # recovers without a restart).
+            logger.critical(f"Initial config load failed: {e} — starting FAIL-CLOSED (all requests blocked) until the config is fixed")
+            self._config = _fail_closed_config()
             self.config_loaded = False
             self.last_reload_error = f"initial load failed: {e}"
 
@@ -135,11 +140,14 @@ class ConfigManager:
             return True
 
 
-def _empty_config():
-    """A valid Config built from an empty YAML (all checks disabled)."""
+def _fail_closed_config():
+    """A valid Config whose rules block everything (IP whitelist mode with an
+    empty whitelist short-circuits every request). Used when the real config
+    can't be loaded at startup — allow-all would be the fail-open we promise
+    never to serve."""
     import tempfile
     with tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False) as f:
-        f.write('')
+        f.write('ip:\n  mode: whitelist\n  whitelist: []\n')
         path = f.name
     try:
         return Config(config_path=path)

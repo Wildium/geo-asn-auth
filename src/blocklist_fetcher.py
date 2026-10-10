@@ -18,11 +18,17 @@ CACHE_DIR = os.getenv('BLOCKLIST_CACHE_DIR', '/blocklists')
 
 # Remote list fetch timeout (s). Must stay well below the gunicorn worker
 # timeout (30s) because config reloads — which re-fetch lists — run inline
-# on the ForwardAuth request path.
+# on the request path.
 FETCH_TIMEOUT = float(os.getenv('BLOCKLIST_FETCH_TIMEOUT', '10'))
 
+# Aggregate budget across ALL list fetches in one config load (s). Per-URL
+# timeouts don't bound the total: N stale URLs = N x FETCH_TIMEOUT, which can
+# exceed the worker timeout and SIGKILL the worker mid-reload. The check runs
+# before each fetch, so worst case is budget + one in-flight FETCH_TIMEOUT.
+FETCH_BUDGET_S = float(os.getenv('BLOCKLIST_FETCH_BUDGET_S', '15'))
 
-def fetch_text_list(url, cache_hours=168, list_type='text'):
+
+def fetch_text_list(url, cache_hours=168, list_type='text', deadline=None):
     """
     Fetch a text list from URL (one entry per line) with caching.
     Used for user-agent lists, generic text files, etc.
@@ -31,6 +37,8 @@ def fetch_text_list(url, cache_hours=168, list_type='text'):
         url: URL or local file path
         cache_hours: Cache duration in hours
         list_type: Type description for logging (e.g., 'user-agent', 'text')
+        deadline: time.monotonic() value past which no fresh fetch is
+            attempted (aggregate budget; falls back to stale cache)
     
     Returns:
         set: Set of non-empty, stripped lines from the file
@@ -66,6 +74,11 @@ def fetch_text_list(url, cache_hours=168, list_type='text'):
             with open(local_path, 'r') as f:
                 content = f.read()
         else:
+            # Aggregate budget: past the deadline, skip the network and fall
+            # back to stale cache below — N slow URLs must not stack up past
+            # the gunicorn worker timeout on the request path.
+            if deadline is not None and time.monotonic() > deadline:
+                raise TimeoutError(f"fetch budget ({FETCH_BUDGET_S}s) exhausted")
             # Remote URL — keep the timeout well under the gunicorn worker
             # timeout (30s): a config reload runs inline on the request path,
             # and a slow blocklist URL must not stall the worker to SIGKILL.
@@ -96,7 +109,7 @@ def fetch_text_list(url, cache_hours=168, list_type='text'):
         return set()
 
 
-def fetch_asn_list(source, timeout=10, cache_hours=168):
+def fetch_asn_list(source, timeout=10, cache_hours=168, deadline=None):
     """
     Fetch ASN list from remote URL or local file path.
     
@@ -104,6 +117,8 @@ def fetch_asn_list(source, timeout=10, cache_hours=168):
         source: URL or file path to fetch ASN list from
         timeout: Request timeout in seconds (default: 10)
         cache_hours: Cache validity period in hours (default: 168 = 7 days)
+        deadline: time.monotonic() value past which no fresh fetch is
+            attempted (aggregate budget; falls back to stale cache)
     
     Returns:
         List of ASN numbers (integers)
@@ -117,7 +132,7 @@ def fetch_asn_list(source, timeout=10, cache_hours=168):
                 content = f.read()
         else:
             # Handle remote URLs with caching
-            content = _fetch_remote_asn_list(source, timeout, cache_hours)
+            content = _fetch_remote_asn_list(source, timeout, cache_hours, deadline=deadline)
         
         # Parse ASNs from content
         asns = _parse_asn_content(content, source)
@@ -135,7 +150,7 @@ def fetch_asn_list(source, timeout=10, cache_hours=168):
         return []
 
 
-def _fetch_remote_asn_list(source, timeout, cache_hours):
+def _fetch_remote_asn_list(source, timeout, cache_hours, deadline=None):
     """
     Fetch ASN list from remote URL with caching support.
     
@@ -143,6 +158,7 @@ def _fetch_remote_asn_list(source, timeout, cache_hours):
         source: URL to fetch from
         timeout: Request timeout in seconds
         cache_hours: Cache validity period in hours
+        deadline: time.monotonic() past which no fresh fetch is attempted
     
     Returns:
         Content of the ASN list as string
@@ -161,6 +177,16 @@ def _fetch_remote_asn_list(source, timeout, cache_hours):
     
     # Fetch from URL if no valid cache
     if content is None:
+        # Aggregate budget: past the deadline, skip the network. Serve stale
+        # cache if we have it; otherwise the caller's except-path returns []
+        # and the last-good config keeps serving (reload failure = no swap).
+        if deadline is not None and time.monotonic() > deadline:
+            logger.warning(f"Fetch budget ({FETCH_BUDGET_S}s) exhausted for {source}")
+            if os.path.exists(cache_file):
+                logger.warning(f"Using STALE cached ASN list from {source}")
+                with open(cache_file, 'r') as f:
+                    return f.read()
+            raise TimeoutError(f"fetch budget exhausted, no stale cache for {source}")
         logger.info(f"Fetching ASN list from {source}")
         response = requests.get(source, timeout=timeout)
         response.raise_for_status()

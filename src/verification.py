@@ -220,7 +220,10 @@ def _check_country(client_ip, config):
         
         logger.debug(f"Country check passed for {client_ip}: {country_code}")
         
-    except AddressNotFoundError:
+    except (AddressNotFoundError, ValueError):
+        # ValueError: client_ip isn't a parseable IP (e.g. garbage in
+        # X-Forwarded-For). Treat as unknown geo — honoring allow_unknown —
+        # instead of letting it hit the catch-all and fail open (200).
         logger.warning(f"Country not found for IP: {client_ip}")
         if not config.allow_unknown:
             logger.info(f"Blocked IP {client_ip} (country not found, ALLOW_UNKNOWN=false)")
@@ -245,7 +248,9 @@ def _check_asn(client_ip, config):
         asn_number = info['number']
         asn_org = info['org']
         
-        # Whitelist mode: only allow listed ASNs (strict mode)
+        # Whitelist mode: only allow listed ASNs (strict mode). An entry with
+        # user_agents conditions only matches when the UA matches too — same
+        # semantics as blacklist mode.
         if config.asn_mode == 'whitelist':
             if not config.asn_whitelist or asn_number not in config.asn_whitelist:
                 logger.info(f"Blocked IP {client_ip} from ASN {asn_number} (not in whitelist)")
@@ -257,6 +262,19 @@ def _check_asn(client_ip, config):
                     block_page_template=config.block_page_template,
                     status=config.block_status
                 )
+            patterns = config.asn_whitelist[asn_number]
+            if patterns:
+                user_agent = request.headers.get('User-Agent', '')
+                if not any(fnmatch.fnmatch(user_agent, p) for p in patterns):
+                    logger.info(f"Blocked IP {client_ip} from ASN {asn_number} (whitelisted ASN but user-agent '{user_agent}' doesn't match required patterns: {patterns})")
+                    return render_block_page(
+                        f"Access from your network (AS{asn_number}) is not permitted.",
+                        client_ip,
+                        asn=f"AS{asn_number} - {asn_org}",
+                        use_html_response=config.use_html_response,
+                        block_page_template=config.block_page_template,
+                        status=config.block_status
+                    )
         
         # Blacklist mode: block listed ASNs, but allow whitelisted exceptions
         elif config.asn_mode == 'blacklist':
@@ -299,7 +317,8 @@ def _check_asn(client_ip, config):
         
         logger.debug(f"ASN check passed for {client_ip}: {asn_number}")
         
-    except AddressNotFoundError:
+    except (AddressNotFoundError, ValueError):
+        # ValueError: unparseable client_ip (garbage XFF) — see _check_country.
         logger.warning(f"ASN not found for IP: {client_ip}")
         if not config.allow_unknown:
             logger.info(f"Blocked IP {client_ip} (ASN not found, ALLOW_UNKNOWN=false)")

@@ -71,7 +71,8 @@ def health():
         "dbs_loaded": bool(cfg.geo_provider.country_available or cfg.geo_provider.asn_available),
         "config_loaded": status["config_loaded"],
         "last_reload": status["last_reload"],
-        "last_reload_error": status["last_reload_error"],
+        # last_reload_error intentionally NOT here: it can quote config file
+        # paths. It's behind ADMIN_TOKEN at /health/detail.
     }), 200
 
 

@@ -113,6 +113,10 @@ class Config:
         Falls back to the CONFIG_PATH env / module default when omitted.
         """
         self._config_path = config_path
+        # One aggregate fetch budget per config load (shared by ASN and UA
+        # list fetchers) so N stale URLs can't stack past the worker timeout.
+        from .blocklist_fetcher import FETCH_BUDGET_S
+        self._fetch_deadline = time.monotonic() + FETCH_BUDGET_S
         # Load YAML config
         self.raw_config = self._load_yaml_config()
         
@@ -212,13 +216,6 @@ class Config:
         
         # Log configuration
         self._log_config()
-    
-    def close(self):
-        """Release database handles (called on hot-reload swap)."""
-        try:
-            self.geo_provider.close()
-        except Exception:
-            pass
     
     def _parse_domain_config(self, domain, domain_config):
         """
@@ -477,7 +474,8 @@ class Config:
                 entries = fetch_text_list(
                     url,
                     cache_hours=self.cache_hours,
-                    list_type='user-agent'
+                    list_type='user-agent',
+                    deadline=self._fetch_deadline,
                 )
                 all_entries.update(entries)
                 logger.info(f"Loaded {len(entries)} user-agents from {url}")
@@ -494,7 +492,8 @@ class Config:
             logger.info(f"Fetching ASN lists from {len(blacklist_urls)} source(s)")
             manual_count = len(asn_config.get('blacklist', []))
             for source in blacklist_urls:
-                remote_asns = fetch_asn_list(source, cache_hours=self.cache_hours)
+                remote_asns = fetch_asn_list(source, cache_hours=self.cache_hours,
+                                             deadline=self._fetch_deadline)
                 self.asn_blacklist.update(remote_asns)
             logger.info(f"Total ASN blacklist size: {len(self.asn_blacklist)} "
                        f"(including {manual_count} manual entries)")
@@ -504,7 +503,8 @@ class Config:
         if whitelist_urls:
             logger.info(f"Fetching ASN whitelist from {len(whitelist_urls)} source(s)")
             for source in whitelist_urls:
-                remote_asns = fetch_asn_list(source, cache_hours=self.cache_hours)
+                remote_asns = fetch_asn_list(source, cache_hours=self.cache_hours,
+                                             deadline=self._fetch_deadline)
                 # asn_whitelist is a dict {asn: user_agent_patterns|None} —
                 # dict.update(list_of_ints) raises TypeError; insert per-entry.
                 for asn_num in remote_asns:

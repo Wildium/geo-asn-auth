@@ -35,12 +35,14 @@ _audit_path = None
 
 # ---------------------------------------------------------------------- #
 # Per-IP throttle on failed admin auth (brute-force backstop).
-# Counts only 401/404 auth failures, not successful calls, so a legitimate
-# admin is never rate-limited. In-memory and per-worker: a strong token makes
-# this a belt-and-braces control, not the primary one.
+# Counts only 401 auth failures (wrong/missing bearer token), not successful
+# calls and not the 404 "admin disabled" path, so a legitimate admin is never
+# rate-limited. In-memory and per-worker: a strong token makes this a
+# belt-and-braces control, not the primary one.
 # ---------------------------------------------------------------------- #
 _FAIL_WINDOW_S = int(os.getenv('ADMIN_FAIL_WINDOW_S', '60'))
 _FAIL_MAX = int(os.getenv('ADMIN_FAIL_MAX', '10'))
+_FAIL_MAX_IPS = int(os.getenv('ADMIN_FAIL_MAX_IPS', '1000'))
 _fail_counts = {}          # ip -> [timestamps of failures within window]
 _fail_lock = threading.Lock()
 
@@ -73,6 +75,16 @@ def _record_failure(ip):
     now = time.monotonic()
     cutoff = now - _FAIL_WINDOW_S
     with _fail_lock:
+        # Bound the dict: XFF is spoofable, so an attacker can spray unique
+        # "IPs" and grow this without limit. Prune expired entries; if still
+        # full, drop the oldest-seen bucket so memory stays bounded.
+        expired = [k for k, v in _fail_counts.items()
+                   if not v or v[-1] < cutoff]
+        for k in expired:
+            del _fail_counts[k]
+        if len(_fail_counts) >= _FAIL_MAX_IPS:
+            oldest = min(_fail_counts, key=lambda k: _fail_counts[k][0])
+            del _fail_counts[oldest]
         stamps = [t for t in _fail_counts.get(ip, ()) if t >= cutoff]
         stamps.append(now)
         _fail_counts[ip] = stamps
@@ -178,8 +190,12 @@ def _write_config(raw):
         # Hot-reload; roll back on failure
         if not _manager.force_reload():
             if old_text is not None:
-                with open(path, 'w') as f:
+                # Atomic restore — a concurrent poll-reload must never read a
+                # half-written config off the rollback path.
+                rb_path = path + '.rollback'
+                with open(rb_path, 'w') as f:
                     f.write(old_text)
+                os.replace(rb_path, path)
                 _manager.force_reload()
             return False, "reload failed — change rolled back"
         return True, None
