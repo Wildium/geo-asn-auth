@@ -22,7 +22,7 @@ def verify_request(config):
     Returns:
         Flask Response tuple: (response_body, status_code)
         - ('', 200) for allowed requests
-        - (error_response, 403) for blocked requests
+        - (error_response, block_status) for blocked requests (403 default, 404 configurable)
     """
     try:
         # Get domain-specific configuration if available.
@@ -98,7 +98,8 @@ def _check_user_agent(config):
                     "Your user-agent is not authorized.",
                     get_client_ip(),
                     use_html_response=config.use_html_response,
-                    block_page_template=config.block_page_template
+                    block_page_template=config.block_page_template,
+                    status=config.block_status
                 )
         else:
             # No whitelist patterns = block all
@@ -107,7 +108,8 @@ def _check_user_agent(config):
                 "Your user-agent is not authorized.",
                 get_client_ip(),
                 use_html_response=config.use_html_response,
-                block_page_template=config.block_page_template
+                block_page_template=config.block_page_template,
+                status=config.block_status
             )
     
     elif config.user_agent_mode == 'blacklist':
@@ -117,7 +119,8 @@ def _check_user_agent(config):
                 "Your user-agent has been blocked.",
                 get_client_ip(),
                 use_html_response=config.use_html_response,
-                block_page_template=config.block_page_template
+                block_page_template=config.block_page_template,
+                status=config.block_status
             )
     
     return None  # Allowed
@@ -150,7 +153,8 @@ def _check_ip(client_ip, config):
                 "Your IP address has been blocked.",
                 client_ip,
                 use_html_response=config.use_html_response,
-                block_page_template=config.block_page_template
+                block_page_template=config.block_page_template,
+                status=config.block_status
             )
     
     # In whitelist mode: only whitelisted IPs allowed (others continue to country/ASN checks)
@@ -165,7 +169,8 @@ def _check_ip(client_ip, config):
                 "Your IP address is not authorized.",
                 client_ip,
                 use_html_response=config.use_html_response,
-                block_page_template=config.block_page_template
+                block_page_template=config.block_page_template,
+                status=config.block_status
             )
     
     return None
@@ -196,7 +201,8 @@ def _check_country(client_ip, config):
                     client_ip,
                     country=f"{country_name} ({country_code})",
                     use_html_response=config.use_html_response,
-                    block_page_template=config.block_page_template
+                    block_page_template=config.block_page_template,
+                    status=config.block_status
                 )
         
         # Blacklist mode: block listed countries
@@ -208,7 +214,8 @@ def _check_country(client_ip, config):
                     client_ip,
                     country=f"{country_name} ({country_code})",
                     use_html_response=config.use_html_response,
-                    block_page_template=config.block_page_template
+                    block_page_template=config.block_page_template,
+                    status=config.block_status
                 )
         
         logger.debug(f"Country check passed for {client_ip}: {country_code}")
@@ -217,7 +224,7 @@ def _check_country(client_ip, config):
         logger.warning(f"Country not found for IP: {client_ip}")
         if not config.allow_unknown:
             logger.info(f"Blocked IP {client_ip} (country not found, ALLOW_UNKNOWN=false)")
-            return jsonify({"error": "Geographic data unavailable"}), 403
+            return jsonify({"error": "Geographic data unavailable"}), config.block_status
     
     return None
 
@@ -247,7 +254,8 @@ def _check_asn(client_ip, config):
                     client_ip,
                     asn=f"AS{asn_number} - {asn_org}",
                     use_html_response=config.use_html_response,
-                    block_page_template=config.block_page_template
+                    block_page_template=config.block_page_template,
+                    status=config.block_status
                 )
         
         # Blacklist mode: block listed ASNs, but allow whitelisted exceptions
@@ -274,7 +282,8 @@ def _check_asn(client_ip, config):
                             client_ip,
                             asn=f"AS{asn_number} - {asn_org}",
                             use_html_response=config.use_html_response,
-                            block_page_template=config.block_page_template
+                            block_page_template=config.block_page_template,
+                            status=config.block_status
                         )
             # Then check blacklist
             elif config.asn_blacklist and asn_number in config.asn_blacklist:
@@ -284,7 +293,8 @@ def _check_asn(client_ip, config):
                     client_ip,
                     asn=f"AS{asn_number} - {asn_org}",
                     use_html_response=config.use_html_response,
-                    block_page_template=config.block_page_template
+                    block_page_template=config.block_page_template,
+                    status=config.block_status
                 )
         
         logger.debug(f"ASN check passed for {client_ip}: {asn_number}")
@@ -297,7 +307,8 @@ def _check_asn(client_ip, config):
                 "Network information unavailable. Access denied for security reasons.",
                 client_ip,
                 use_html_response=config.use_html_response,
-                block_page_template=config.block_page_template
+                block_page_template=config.block_page_template,
+                status=config.block_status
             )
     
     return None

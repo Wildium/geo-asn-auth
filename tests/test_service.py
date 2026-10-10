@@ -464,6 +464,73 @@ domains:
 
 
 # ---------------------------------------------------------------------- #
+# block_status: configurable 403/404 on block
+# ---------------------------------------------------------------------- #
+class TestBlockStatus:
+    _VERIFY = TestVerification._verify
+
+    def _status(self, cfg, ip):
+        app = _app()
+        with app.test_request_context(headers={'X-Forwarded-For': ip}):
+            resp = verify_request(cfg)
+        return resp[1] if isinstance(resp, tuple) else resp.status_code
+
+    def test_default_is_403(self, make_config):
+        cfg = make_config("ip:\n  mode: blacklist\n  blacklist: ['1.2.3.4']\nsettings:\n  allow_lan: false\n")
+        assert cfg.block_status == 403
+        assert self._status(cfg, '1.2.3.4') == 403
+
+    def test_global_404(self, make_config):
+        cfg = make_config("ip:\n  mode: blacklist\n  blacklist: ['1.2.3.4']\nsettings:\n  allow_lan: false\n  block_status: 404\n")
+        assert self._status(cfg, '1.2.3.4') == 404
+        assert self._status(cfg, '9.9.9.9') == 200
+
+    def test_env_var_override(self, make_config, monkeypatch):
+        monkeypatch.setenv('BLOCK_STATUS', '404')
+        cfg = make_config("ip:\n  mode: blacklist\n  blacklist: ['1.2.3.4']\nsettings:\n  allow_lan: false\n")
+        assert cfg.block_status == 404
+        assert self._status(cfg, '1.2.3.4') == 404
+
+    def test_domain_override(self, make_config):
+        cfg = make_config("""
+ip:
+  mode: blacklist
+  blacklist: ['1.2.3.4']
+settings:
+  allow_lan: false
+domains:
+  secret.example.com:
+    settings:
+      block_status: 404
+""")
+        app = _app()
+        with app.test_request_context(headers={'X-Forwarded-For': '1.2.3.4',
+                                               'Host': 'secret.example.com'}):
+            resp = verify_request(cfg)
+        assert (resp[1] if isinstance(resp, tuple) else resp.status_code) == 404
+        # other domains keep the global 403
+        with app.test_request_context(headers={'X-Forwarded-For': '1.2.3.4',
+                                               'Host': 'other.example.com'}):
+            resp = verify_request(cfg)
+        assert (resp[1] if isinstance(resp, tuple) else resp.status_code) == 403
+
+    def test_invalid_value_rejected(self, make_config):
+        with pytest.raises(ValueError):
+            make_config("settings:\n  block_status: 418\n")
+        with pytest.raises(ValueError):
+            make_config("settings:\n  block_status: nope\n")
+
+    def test_html_page_uses_configured_status(self, tmp_path):
+        """HTML path (not just JSON) must carry the configured status."""
+        from src.utils import render_block_page
+        tmpl = '<html><h1>{{reason}}</h1></html>'
+        r = render_block_page('blocked', '1.2.3.4', use_html_response=True,
+                              block_page_template=tmpl, status=404)
+        assert r.status_code == 404
+        assert 'text/html' in r.content_type
+
+
+# ---------------------------------------------------------------------- #
 # Downstream hardening: UI gating + per-IP auth throttle
 # ---------------------------------------------------------------------- #
 class TestAdminHardening:

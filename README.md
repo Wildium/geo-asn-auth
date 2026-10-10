@@ -276,6 +276,7 @@ environment:
   - PORT=9876                      # Service port
   - ALLOW_LAN=true                 # Allow private/LAN IPs
   - ALLOW_UNKNOWN=true             # Allow when geo data unavailable
+  - BLOCK_STATUS=403               # HTTP status on block: 403 (default) or 404
   - CACHE_HOURS=168                # Blocklist cache duration (default: 7 days)
   - CONFIG_PATH=/app/config.yaml
   - COUNTRY_DB_PATH=/data/GeoLite2-Country.mmdb
@@ -288,6 +289,23 @@ environment:
   - ADMIN_FAIL_MAX=10              # Failed admin auth attempts per IP before 429
   - ADMIN_FAIL_WINDOW_S=60         # Sliding window (s) for the above
 ```
+
+## Block Response
+
+Blocked requests return **403** by default. Set `block_status: 404` (in `settings:`, or the `BLOCK_STATUS` env var) to return **404** instead — blocked clients then can't confirm the route exists, which many operators prefer for public-facing services. Only 403 and 404 are accepted; anything else fails config validation at startup rather than silently falling back.
+
+The setting is per-domain overridable, like the other settings:
+
+```yaml
+settings:
+  block_status: 403        # global default
+domains:
+  admin.example.com:
+    settings:
+      block_status: 404    # this domain hides blocked routes
+```
+
+The block page (HTML or JSON, see `use_html_response`) carries the configured status; the default HTML page is status-neutral ("Access Denied") so it works for either.
 
 ## Filtering Modes
 

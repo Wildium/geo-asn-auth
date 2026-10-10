@@ -120,6 +120,8 @@ class Config:
         self.allow_lan = os.getenv('ALLOW_LAN', str(settings.get('allow_lan', True))).lower() == 'true'
         self.allow_unknown = os.getenv('ALLOW_UNKNOWN', str(settings.get('allow_unknown', True))).lower() == 'true'
         self.use_html_response = os.getenv('USE_HTML_RESPONSE', str(settings.get('use_html_response', True))).lower() == 'true'
+        self.block_status = self._parse_block_status(
+            os.getenv('BLOCK_STATUS', settings.get('block_status', 403)))
         self.cache_hours = int(os.getenv('CACHE_HOURS', str(settings.get('cache_hours', 168))))
         dns_ttl = int(os.getenv('DNS_TTL', str(settings.get('dns_ttl', DNS_TTL))))
         self.resolver = HostnameResolver(ttl=dns_ttl)
@@ -386,6 +388,8 @@ class Config:
                 domain_obj.allow_unknown = settings['allow_unknown']
             if 'use_html_response' in settings:
                 domain_obj.use_html_response = settings['use_html_response']
+            if 'block_status' in settings:
+                domain_obj.block_status = self._parse_block_status(settings['block_status'])
         
         logger.debug(f"Created domain config for '{domain_config.get('_domain', 'unknown')}'")
         return domain_obj
@@ -517,6 +521,21 @@ class Config:
             logger.warning(f"Could not load HTML template: {e}, using JSON responses only")
             return None
     
+    @staticmethod
+    def _parse_block_status(value):
+        """block_status: HTTP status returned on block. 403 (default) or 404.
+
+        404 is a legit hardening choice — blocked clients can't confirm the
+        route exists. Anything else is a config error, not a silent fallback.
+        """
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"block_status must be 403 or 404, got {value!r}")
+        if status not in (403, 404):
+            raise ValueError(f"block_status must be 403 or 404, got {status}")
+        return status
+
     def _validate_config(self):
         """Validate configuration settings."""
         valid_modes = ('whitelist', 'blacklist', 'disabled')

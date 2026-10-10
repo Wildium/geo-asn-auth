@@ -128,6 +128,7 @@ settings:
   allow_lan: true          # Allow private/LAN IPs (192.168.x.x, 10.x.x.x, etc.)
   allow_unknown: true      # Allow if country/ASN cannot be determined
   use_html_response: true  # Return HTML block page (false for JSON response)
+  block_status: 403        # HTTP status on block: 403 (default) or 404 (hide that the route exists)
   cache_hours: 168         # Cache duration for remote ASN lists (default: 168 hours = 7 days)
   dns_ttl: 60              # TTL (seconds) for hostname/DDNS entries in IP lists
 

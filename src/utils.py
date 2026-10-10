@@ -56,7 +56,8 @@ def get_client_ip():
 
 
 def render_block_page(reason, client_ip, country=None, asn=None, 
-                     use_html_response=True, block_page_template=None):
+                     use_html_response=True, block_page_template=None,
+                     status=403):
     """
     Render custom HTML block page or return JSON error response.
     
@@ -67,16 +68,17 @@ def render_block_page(reason, client_ip, country=None, asn=None,
         asn: Optional ASN information string
         use_html_response: Whether to use HTML or JSON response
         block_page_template: HTML template string (optional)
+        status: HTTP status to return on block (403 default, 404 supported)
     
     Returns:
-        Flask Response object with 403 status code
+        Flask Response object with the configured block status code
     """
     request_id = str(uuid.uuid4())[:8]
     timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     
     # Return JSON if HTML is disabled or template not loaded
     if not use_html_response or not block_page_template:
-        return jsonify({"error": reason, "ip": client_ip, "request_id": request_id}), 403
+        return jsonify({"error": reason, "ip": client_ip, "request_id": request_id}), status
     
     # Render HTML template
     html = block_page_template
@@ -100,4 +102,4 @@ def render_block_page(reason, client_ip, country=None, asn=None,
         # Remove conditional section
         html = re.sub(r'{{#asn}}.*?{{/asn}}', '', html, flags=re.DOTALL)
     
-    return Response(html, status=403, mimetype='text/html')
+    return Response(html, status=status, mimetype='text/html')
