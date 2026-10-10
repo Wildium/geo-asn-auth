@@ -204,6 +204,8 @@ You can override global settings for specific domains by adding a `domains:` sec
 
 **Matching**: Domains are matched against the `Host` header. Supports exact matches and wildcards (`*.example.com`). The `Host` header is used because the fronting proxy pins it per-vhost, so a client can't forge it to reach a more-permissive domain config. If your proxy sets `X-Forwarded-Host` and you trust it, set `TRUST_FORWARDED_HOST=true` to prefer that header instead.
 
+> **Gotcha:** if your proxy's auth call sends its own `Host` (e.g. Traefik ForwardAuth sends `Host=<target-name>`, not the public hostname), no domain will ever match and **every request silently falls back to the global config** — domain IP/ASN whitelists and `asn: disabled` overrides stop enforcing with no error. Set `TRUST_FORWARDED_HOST=true` in that setup, and only if your proxy sets `X-Forwarded-Host` itself and strips client-supplied copies (Traefik does this via `hostsProxyHeaders`).
+
 **Three Override Strategies:**
 
 1. **REPLACE** (default) - Ignore global config, use only domain-specific settings

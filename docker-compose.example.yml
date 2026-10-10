@@ -33,6 +33,11 @@ services:
       # - ALLOW_LAN=true                             # Allow private/LAN IPs (default: true)
       # - ALLOW_UNKNOWN=true                         # Allow when geo data unavailable (default: true)
       # - USE_HTML_RESPONSE=true                     # Use HTML for blocked pages (default: true, set to false for JSON)
+      # - TRUST_FORWARDED_HOST=true                  # Prefer X-Forwarded-Host over Host for domain matching.
+      #   REQUIRED when the fronting proxy's auth call sends its own Host (e.g. Traefik/Pangolin
+      #   ForwardAuth sends Host=<target-name>). Without it, domain-specific rules silently stop
+      #   matching and every request falls back to the global config. Only enable if your proxy
+      #   sets X-Forwarded-Host itself and strips client-supplied copies (Traefik: hostsProxyHeaders).
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9876/health')"]
       interval: 30s
