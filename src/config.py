@@ -24,7 +24,8 @@ from .geo_providers import create_provider, IPINFO_LITE_DB_PATH
 logger = logging.getLogger(__name__)
 
 # Configuration paths
-CONFIG_PATH = os.getenv('CONFIG_PATH', '/app/config.yaml')
+DEFAULT_CONFIG_PATH = '/app/config.yaml'
+CONFIG_PATH = os.getenv('CONFIG_PATH', DEFAULT_CONFIG_PATH)
 CONFIG_EXAMPLE_PATH = '/app/config.example.yaml'
 COUNTRY_DB_PATH = os.getenv('COUNTRY_DB_PATH', '/data/GeoLite2-Country.mmdb')
 ASN_DB_PATH = os.getenv('ASN_DB_PATH', '/data/GeoLite2-ASN.mmdb')
@@ -199,13 +200,12 @@ class Config:
         # rebuild recompiled regexes on every hit). Domain configs are static —
         # build once at load, dict-lookup per request. Must run AFTER the geo
         # provider loads: domain objects are shallow copies of this instance's
-        # attributes at copy time.
+        # attributes at copy time. A failure here raises so the whole load
+        # fails — silently dropping a domain's strict rules while reporting
+        # healthy is worse than keeping the last-good config.
         self._domain_config_cache = {}
         for pattern, parsed in self.domain_configs.items():
-            try:
-                self._domain_config_cache[pattern] = self._create_domain_config(parsed)
-            except Exception as e:
-                logger.error(f"Failed to precompute domain config for {pattern}: {e}")
+            self._domain_config_cache[pattern] = self._create_domain_config(parsed)
         
         # Log configuration
         self._log_config()
@@ -249,8 +249,12 @@ class Config:
         if not host:
             return self
         
-        # Strip port if present
-        host = host.split(':')[0].lower()
+        # Strip port if present (bracketed IPv6 literal hosts keep their form)
+        if host.startswith('['):
+            host = host.split(']')[0] + ']' if ']' in host else host
+        else:
+            host = host.split(':')[0]
+        host = host.lower()
         
         # Exact match first
         if host in self.domain_configs:
@@ -280,9 +284,10 @@ class Config:
         # Create a shallow copy of self
         domain_obj = object.__new__(Config)
         
-        # Copy all attributes from global config
+        # Copy all attributes from global config (skip the parent's own
+        # domain caches — a domain object must not alias the parent's cache)
         for attr, value in self.__dict__.items():
-            if not attr.startswith('domain_configs'):
+            if attr not in ('domain_configs', '_domain_config_cache'):
                 setattr(domain_obj, attr, value)
         
         # Apply overrides based on extend strategy
@@ -387,20 +392,28 @@ class Config:
     
     def _load_yaml_config(self):
         """Load configuration from YAML file."""
-        # Explicit path (from ConfigManager) wins, then env default, then example
-        config_paths = [self._config_path or CONFIG_PATH, CONFIG_EXAMPLE_PATH]
-        
+        explicit = self._config_path
+        # Explicit path (from ConfigManager) wins, then env default, then example.
+        config_paths = [explicit or CONFIG_PATH, CONFIG_EXAMPLE_PATH]
+
         for path in config_paths:
             try:
                 if os.path.exists(path):
                     with open(path, 'r') as f:
-                        config = yaml.safe_load(f)
+                        config = yaml.safe_load(f) or {}
                         logger.info(f"Loaded configuration from {path}")
                         return config
             except Exception as e:
                 logger.error(f"Failed to load config from {path}: {e}")
                 raise
-        
+
+        # A user-set CONFIG_PATH pointing at a missing file is a
+        # misconfiguration (typo'd mount) — fail loudly rather than silently
+        # serving example rules or an allow-all empty config. The built-in
+        # default falling back to the bundled example is documented behavior.
+        if explicit and explicit != DEFAULT_CONFIG_PATH:
+            raise FileNotFoundError(f"Config file not found: {explicit}")
+
         logger.warning("No config file found, using empty defaults")
         return {}
     
@@ -487,7 +500,10 @@ class Config:
             logger.info(f"Fetching ASN whitelist from {len(whitelist_urls)} source(s)")
             for source in whitelist_urls:
                 remote_asns = fetch_asn_list(source, cache_hours=self.cache_hours)
-                self.asn_whitelist.update(remote_asns)
+                # asn_whitelist is a dict {asn: user_agent_patterns|None} —
+                # dict.update(list_of_ints) raises TypeError; insert per-entry.
+                for asn_num in remote_asns:
+                    self.asn_whitelist[int(asn_num)] = None
             logger.info(f"Total ASN whitelist size: {len(self.asn_whitelist)}")
     
     def _load_html_template(self):

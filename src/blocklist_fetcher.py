@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 # read-only or unwritable default path.
 CACHE_DIR = os.getenv('BLOCKLIST_CACHE_DIR', '/blocklists')
 
+# Remote list fetch timeout (s). Must stay well below the gunicorn worker
+# timeout (30s) because config reloads — which re-fetch lists — run inline
+# on the ForwardAuth request path.
+FETCH_TIMEOUT = float(os.getenv('BLOCKLIST_FETCH_TIMEOUT', '10'))
+
 
 def fetch_text_list(url, cache_hours=168, list_type='text'):
     """
@@ -61,8 +66,10 @@ def fetch_text_list(url, cache_hours=168, list_type='text'):
             with open(local_path, 'r') as f:
                 content = f.read()
         else:
-            # Remote URL
-            response = requests.get(url, timeout=30)
+            # Remote URL — keep the timeout well under the gunicorn worker
+            # timeout (30s): a config reload runs inline on the request path,
+            # and a slow blocklist URL must not stall the worker to SIGKILL.
+            response = requests.get(url, timeout=FETCH_TIMEOUT)
             response.raise_for_status()
             content = response.text
         

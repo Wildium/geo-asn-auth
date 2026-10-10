@@ -378,6 +378,92 @@ domains:
 
 
 # ---------------------------------------------------------------------- #
+# Review-round fixes (M1/M2/M3, S1/S2)
+# ---------------------------------------------------------------------- #
+class TestReviewFixes:
+    def test_empty_config_file_loads(self, make_config):
+        """M1: yaml.safe_load('') -> None used to crash Config, which made
+        _empty_config (the startup fallback) itself crash — container died
+        on a config typo instead of serving last-good/empty."""
+        cfg = make_config("")
+        assert cfg.ip_mode == 'disabled'
+
+    def test_empty_config_fallback_in_manager(self, tmp_path, monkeypatch):
+        """M1 end-to-end: a config that fails validation must fall back to
+        an empty Config, not raise out of ConfigManager.__init__."""
+        from src.manager import ConfigManager
+        p = tmp_path / 'config.yaml'
+        p.write_text("ip:\n  mode: bogus\n")
+        monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
+        mgr = ConfigManager(config_path=str(p), poll_interval=0)
+        assert mgr.config_loaded is False
+        assert mgr.current() is not None
+
+    def test_missing_explicit_config_raises(self, tmp_path, monkeypatch):
+        """S2: typo'd CONFIG_PATH must fail loudly, not silently serve
+        example rules or allow-all."""
+        from src.config import Config
+        monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
+        with pytest.raises(FileNotFoundError):
+            Config(config_path=str(tmp_path / 'does-not-exist.yaml'))
+
+    def test_asn_whitelist_urls(self, write_config, tmp_path, monkeypatch):
+        """M3: asn.whitelist_urls did dict.update(list_of_ints) -> TypeError
+        on any non-empty fetched list."""
+        lst = tmp_path / 'wl.txt'
+        lst.write_text("15169\n16509\n")
+        monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
+        cfg_path = write_config(f"""
+asn:
+  mode: whitelist
+  whitelist_urls: ['{lst}']
+""")
+        from src.config import Config
+        cfg = Config(config_path=cfg_path)
+        assert cfg.asn_whitelist.get(15169) is None
+        assert cfg.asn_whitelist.get(16509) is None
+
+    def test_reload_does_not_close_old_readers(self, manager, tmp_path, monkeypatch):
+        """M2: closing the old config's readers on swap let in-flight
+        requests hit a closed MMDB -> ValueError -> fail-open 200."""
+        closed = []
+
+        class FakeProvider:
+            name = 'fake'
+            country_available = True
+            asn_available = False
+            def country_lookup(self, ip):
+                return {'iso_code': 'CN', 'name': 'China'}
+            def close(self):
+                closed.append(True)
+
+        mgr = manager("""
+countries:
+  mode: blacklist
+  blacklist: ['CN']
+""")
+        import src.config as cfgmod
+        monkeypatch.setattr(cfgmod, 'create_provider',
+                            lambda *a, **k: FakeProvider())
+        mgr.force_reload()
+        assert closed == [], "reload must not close the old provider"
+        # old config object still usable (GC will reclaim it)
+        mgr.force_reload()
+        assert closed == []
+
+    def test_domain_precompute_failure_fails_load(self, make_config):
+        """S1: a broken domain override must fail the whole load (keep
+        last-good on reload), not silently drop the domain's rules."""
+        with pytest.raises(AttributeError):
+            make_config("""
+domains:
+  admin.example.com:
+    countries:
+      whitelist: [123]
+""")
+
+
+# ---------------------------------------------------------------------- #
 # Hot-reload (issue #3)
 # ---------------------------------------------------------------------- #
 class TestHotReload:

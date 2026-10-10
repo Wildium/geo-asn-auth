@@ -119,7 +119,6 @@ class ConfigManager:
                 logger.error(f"Config reload FAILED — keeping last-good config: {e}")
                 return False
 
-            old = self._config
             self._config = new_config
             self.config_loaded = True
             self.reload_count += 1
@@ -128,13 +127,11 @@ class ConfigManager:
             self._stat_file()
             logger.info("Config hot-reloaded successfully")
 
-            # Close old DB handles only after the swap so in-flight requests
-            # on other threads never see a closed reader.
-            if old is not None and old is not new_config:
-                try:
-                    old.close()
-                except Exception as e:
-                    logger.warning(f"Error closing old config resources: {e}")
+            # Do NOT close the old config's DB readers: a request thread that
+            # grabbed current() before the swap may still be mid-lookup, and
+            # reading a closed MMDB raises ValueError which verify_request's
+            # catch-all turns into a fail-open 200. Let the old Config (and its
+            # readers) be reclaimed by GC once the last reference drops.
             return True
 
 
