@@ -1,6 +1,6 @@
 services:
   geo-asn-auth:
-    image: ghcr.io/wildetechsolutions/geo-asn-auth:latest
+    image: ghcr.io/wildium/geo-asn-auth:latest
     # Override container user to match your host user for proper file permissions
     # Uncomment and set to your UID:GID (run `id -u` and `id -g` to find yours)
     # user: "1001:1001"

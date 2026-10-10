@@ -19,7 +19,7 @@ There are 4 main requirements to run this application.
 ```yml "docker-compose.yml"
 services:
   geo-asn-auth:
-    image: ghcr.io/wildetechsolutions/geo-asn-auth:latest
+    image: ghcr.io/wildium/geo-asn-auth:latest
     # user: "1001:1001"
     container_name: geo-asn-auth
     restart: unless-stopped
