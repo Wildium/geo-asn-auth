@@ -624,10 +624,55 @@ settings:
         monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
         monkeypatch.setattr(bf, 'CACHE_DIR', str(tmp_path / 'cache'))
         with patch.object(bf.requests, 'get') as mock_get:
-            with pytest.raises(bf.FetchBudgetExceeded):
+            with pytest.raises(bf.BlocklistLoadError):
                 bf.fetch_text_list('http://example.com/ua.txt', list_type='user-agent',
                                    deadline=time.monotonic() - 1)
         mock_get.assert_not_called()
+
+    def test_ordinary_fetch_error_fails_reload_not_silent_drop(self, manager, tmp_path, monkeypatch):
+        """A blocklist URL that 404s/DNS-fails WITHIN budget must also fail
+        the reload — not swap in a config with the remote list dropped.
+        Same fail-open class as budget exhaustion; stale cache still works."""
+        import src.blocklist_fetcher as bf
+        mgr = manager("asn:\n  mode: blacklist\n  blacklist: [111]\n")
+        assert 111 in mgr.current().asn_blacklist
+        cfg_path = tmp_path / 'config.yaml'
+        cfg_path.write_text(
+            "asn:\n  mode: blacklist\n  blacklist: [111]\n"
+            "  blacklist_urls: ['http://unreachable.invalid/list.txt']\n")
+        time.sleep(0.01)
+        # normal budget, real DNS failure (unreachable.invalid never resolves)
+        assert mgr.force_reload() is False
+        assert 111 in mgr.current().asn_blacklist  # last-good still serving
+
+    def test_transient_startup_failure_retries_each_poll(self, tmp_path, monkeypatch):
+        """Startup failed while the file EXISTS (transient fetch error): the
+        poll must keep retrying until it succeeds, not dead-end after one
+        try. Regression for the _file_changed one-shot retry bug."""
+        import src.blocklist_fetcher as bf
+        from src.manager import ConfigManager
+        monkeypatch.setenv('BLOCKLIST_CACHE_DIR', str(tmp_path / 'cache'))
+        path = tmp_path / 'config.yaml'
+        path.write_text(
+            "asn:\n  mode: blacklist\n  blacklist: [111]\n"
+            "  blacklist_urls: ['http://unreachable.invalid/list.txt']\n")
+        monkeypatch.setattr(bf, 'FETCH_BUDGET_S', 0.0)  # force load failure
+        mgr = ConfigManager(config_path=str(path), poll_interval=0)
+        assert mgr.config_loaded is False
+        # operator's URL is still down: repeated polls keep retrying (and fail)
+        mgr.current(); mgr.current()
+        assert mgr.config_loaded is False
+        # URL becomes reachable (budget restored, local file stands in)
+        lst = tmp_path / 'remote.txt'
+        lst.write_text("222\n")
+        cfg_path = str(lst)
+        path.write_text(
+            "asn:\n  mode: blacklist\n  blacklist: [111]\n"
+            f"  blacklist_urls: ['{cfg_path}']\n")
+        monkeypatch.setattr(bf, 'FETCH_BUDGET_S', 15.0)
+        cfg = mgr.current()  # poll retries -> succeeds
+        assert mgr.config_loaded is True
+        assert 222 in cfg.asn_blacklist
 
     def test_budget_exhaustion_fails_reload_not_silent_drop(self, manager, tmp_path, monkeypatch):
         """A reload whose remote ASN list can't be fetched within budget must

@@ -104,7 +104,12 @@ class ConfigManager:
         if (mtime, size) != (self._last_mtime, self._last_size):
             self._last_mtime, self._last_size = mtime, size
             return True
-        return False
+        # While not loaded (e.g. startup failed on a transient blocklist
+        # fetch error), keep retrying every poll — the file didn't change but
+        # the failure may have been transient, and staying fail-closed until
+        # an operator touches the file breaks the auto-recovery promise.
+        # Cheap: everything is blocked anyway, so reload traffic is nil.
+        return not self.config_loaded
 
     def _stat_file(self):
         try:
@@ -149,4 +154,7 @@ def _fail_closed_config():
     can't be loaded at startup — allow-all would be the fail-open we promise
     never to serve. Built from an in-memory dict so the fallback itself can
     never fail (no temp file, no filesystem dependency)."""
-    return Config(config_data={'ip': {'mode': 'whitelist', 'whitelist': []}})
+    return Config(config_data={
+        'settings': {'allow_lan': False, 'allow_unknown': False},
+        'ip': {'mode': 'whitelist', 'whitelist': []},
+    })

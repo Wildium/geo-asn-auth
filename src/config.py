@@ -483,8 +483,8 @@ class Config:
                 all_entries.update(entries)
                 logger.info(f"Loaded {len(entries)} user-agents from {url}")
             except Exception as e:
-                from .blocklist_fetcher import FetchBudgetExceeded
-                if isinstance(e, FetchBudgetExceeded):
+                from .blocklist_fetcher import BlocklistLoadError
+                if isinstance(e, BlocklistLoadError):
                     # Don't swallow: swapping in a config with a UA blocklist
                     # silently dropped is fail-open. Fail the load instead.
                     raise

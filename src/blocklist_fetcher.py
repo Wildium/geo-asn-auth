@@ -28,11 +28,13 @@ FETCH_TIMEOUT = float(os.getenv('BLOCKLIST_FETCH_TIMEOUT', '10'))
 FETCH_BUDGET_S = float(os.getenv('BLOCKLIST_FETCH_BUDGET_S', '15'))
 
 
-class FetchBudgetExceeded(Exception):
-    """Aggregate fetch deadline passed with no stale cache available.
-    Propagates out of fetch_asn_list so the config load FAILS — a failed
-    reload keeps the last-good config serving, which is safer than swapping
-    in a config whose remote ASN list was silently dropped (fail-open)."""
+class BlocklistLoadError(Exception):
+    """A remote blocklist could not be loaded AND no stale cache exists to
+    fall back to. Propagates out of the fetchers so the config load FAILS —
+    a failed reload keeps the last-good config serving, which is safer than
+    swapping in a config whose remote ASN/UA list was silently dropped
+    (fail-open). Causes: fetch budget exhausted, HTTP error, DNS failure,
+    connection refused, etc."""
     pass
 
 
@@ -86,7 +88,7 @@ def fetch_text_list(url, cache_hours=168, list_type='text', deadline=None):
             # back to stale cache below — N slow URLs must not stack up past
             # the gunicorn worker timeout on the request path.
             if deadline is not None and time.monotonic() > deadline:
-                raise FetchBudgetExceeded(f"fetch budget ({FETCH_BUDGET_S}s) exhausted")
+                raise BlocklistLoadError(f"fetch budget ({FETCH_BUDGET_S}s) exhausted")
             # Remote URL — keep the timeout well under the gunicorn worker
             # timeout (30s): a config reload runs inline on the request path,
             # and a slow blocklist URL must not stall the worker to SIGKILL.
@@ -105,11 +107,6 @@ def fetch_text_list(url, cache_hours=168, list_type='text', deadline=None):
         return entries
     
     except Exception as e:
-        if isinstance(e, FetchBudgetExceeded) and not os.path.exists(cache_file):
-            # No stale cache to fall back to: propagate so the config load
-            # fails (last-good keeps serving) instead of swapping in a config
-            # with this UA blocklist silently dropped.
-            raise
         logger.error(f"Failed to fetch {list_type} list from {url}: {e}")
         
         # Try to use stale cache if available
@@ -119,7 +116,10 @@ def fetch_text_list(url, cache_hours=168, list_type='text', deadline=None):
                 entries = {line.strip() for line in f if line.strip() and not line.strip().startswith('#')}
                 return entries
         
-        return set()
+        # No cache to fall back to: an empty list here would swap in a config
+        # with this blocklist silently dropped (fail-open). Fail the load so
+        # the last-good config keeps serving.
+        raise BlocklistLoadError(f"cannot load {list_type} list from {url}: {e}") from e
 
 
 def fetch_asn_list(source, timeout=10, cache_hours=168, deadline=None):
@@ -152,20 +152,20 @@ def fetch_asn_list(source, timeout=10, cache_hours=168, deadline=None):
         logger.info(f"Loaded {len(asns)} ASNs from {source}")
         return asns
         
-    except FetchBudgetExceeded:
+    except BlocklistLoadError:
         # Must NOT be swallowed: an empty return here would swap in a config
         # with the remote ASN list silently dropped (fail-open for blacklist).
         # Propagate so the whole config load fails and last-good keeps serving.
         raise
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to fetch ASN list from {source}: {e}")
-        return []
     except FileNotFoundError as e:
+        # A config-referenced local list that doesn't exist is a
+        # misconfiguration (bad mount) — same fail-open if dropped silently.
+        # Fail the load loudly; hot-reload recovers when the file appears.
         logger.error(f"Local file not found: {source}: {e}")
-        return []
+        raise BlocklistLoadError(f"local ASN list not found: {source}") from e
     except Exception as e:
         logger.error(f"Error loading ASN list from {source}: {e}")
-        return []
+        raise BlocklistLoadError(f"error loading ASN list from {source}: {e}") from e
 
 
 def _fetch_remote_asn_list(source, timeout, cache_hours, deadline=None):
@@ -206,11 +206,21 @@ def _fetch_remote_asn_list(source, timeout, cache_hours, deadline=None):
                 logger.warning(f"Using STALE cached ASN list from {source}")
                 with open(cache_file, 'r') as f:
                     return f.read()
-            raise FetchBudgetExceeded(f"fetch budget exhausted, no stale cache for {source}")
+            raise BlocklistLoadError(f"fetch budget exhausted, no stale cache for {source}")
         logger.info(f"Fetching ASN list from {source}")
-        response = requests.get(source, timeout=timeout)
-        response.raise_for_status()
-        content = response.text
+        try:
+            response = requests.get(source, timeout=timeout)
+            response.raise_for_status()
+            content = response.text
+        except requests.exceptions.RequestException as e:
+            # Ordinary fetch failure (404, DNS, refused, timeout): same policy
+            # as budget exhaustion — stale cache or fail the load. Returning
+            # empty here would silently drop the remote list (fail-open).
+            if os.path.exists(cache_file):
+                logger.warning(f"Using STALE cached ASN list from {source} after fetch error: {e}")
+                with open(cache_file, 'r') as f:
+                    return f.read()
+            raise BlocklistLoadError(f"cannot fetch ASN list from {source}: {e}") from e
         
         # Save to cache
         _save_to_cache(cache_file, cache_time_file, content, source)
