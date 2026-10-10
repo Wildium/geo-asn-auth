@@ -55,8 +55,11 @@ jobs:
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            # Floating tags (major.minor, major) only for stable releases —
+            # a prerelease (v1.1.0-rc1) must NOT move :1.1 / :1 that
+            # downstream users may pin. Prereleases carry a hyphen.
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{major}},enable=${{ !contains(github.ref_name, '-') }}
             type=sha,prefix=sha-,enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
 
